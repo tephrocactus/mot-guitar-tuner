@@ -1,0 +1,48 @@
+[package]
+name = "mot-strobe"
+version = "0.2.3"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[[bin]]
+name = "mot-strobe-standalone"
+path = "src/main.rs"
+required-features = ["standalone"]
+
+# VST3 is the only shipping format in v1. The DSP, parameter model, and
+# editor do not depend on the wrapper so AU can be enabled later without
+# rewriting the tuner.
+[features]
+default = ["vst3", "standalone"]
+vst3 = ["dep:truce-vst3"]
+standalone = ["dep:truce-standalone"]
+shell = ["truce/shell"]
+# Flags any allocation your DSP makes on the audio thread in `process`.
+# Dev/test only: `cargo test --features rt-paranoid`. Off, zero-cost by
+# default.
+rt-paranoid = ["truce/rt-paranoid"]
+
+[dependencies]
+truce = { version = "6.3" }
+# Lightweight types for layout / theme / widget descriptions.
+truce-gui-types = { version = "6.3" }
+truce-egui = { version = "6.3" }
+truce-vst3 = { version = "6.3", optional = true }
+truce-standalone = { version = "6.3", features = ["gui"], optional = true }
+egui = "0.34"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+
+# Custom profile for `cargo truce install --shell`. The shell-mode
+# build (`cargo build --profile shell --features ...,shell`) lands the
+# shell binary at `target/shell/lib<crate>.dylib`, independent of
+# `target/release/` (where regular `cargo build --release` writes) and
+# `target/debug/` (where `cargo build` writes). Inherits release for
+# DSP perf parity.
+[profile.shell]
+inherits = "release"

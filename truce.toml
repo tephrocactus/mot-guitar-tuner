@@ -1,0 +1,20 @@
+[vendor]
+name = "Plut & Mot"
+id = "com.plutandmot"
+url = "https://plutandmot.local"
+au_manufacturer = "PMot"
+
+[[plugin]]
+name = "MOT Strobe"
+bundle_id = "mot-strobe"
+crate = "mot-strobe"
+category = "effect"
+fourcc = "MStr"
+au_tag = "Effects"
+# VST3 secondary subcategory — drives the Cubase plugin submenu.
+# Tighten to your effect kind: "Delay", "Distortion", "Dynamics",
+# "EQ", "Filter", "Mastering", "Modulation", "Pitch Shift",
+# "Reverb", "Surround", "Analyzer", "Spatial". Leave as "Tools" for
+# generic utilities. Without this, Cubase buckets the plugin under
+# "Other".
+vst3_subcategory = "Analyzer"

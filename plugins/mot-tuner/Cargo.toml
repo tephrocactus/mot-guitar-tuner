@@ -1,6 +1,6 @@
 [package]
 name = "mot-tuner"
-version = "0.5.1"
+version = "0.5.2"
 edition = "2024"
 
 [lib]
@@ -10,7 +10,7 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 default = ["vst3"]
 vst3 = ["dep:truce-vst3"]
 shell = ["truce/shell"]
-rt-paranoid = ["truce/rt-paranoid", "mot-core/rt-paranoid"]
+rt-paranoid = ["truce/rt-paranoid"]
 
 [dependencies]
 mot-core = { path = "../.." }

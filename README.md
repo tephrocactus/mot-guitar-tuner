@@ -1,110 +1,39 @@
-# MOT Guitar Suite
+# MOT TUNER
 
-Private Apple-Silicon guitar tools built as three independent mono VST3
-plug-ins in one Rust workspace:
+Native Apple-Silicon chromatic strobe tuner for mono guitar input.
 
-- **MOT TRAINER** — records a DAW-aligned render of the canonical excitation,
-  trains the causal A2 model, applies the validation gate, and publishes an
-  immutable model.
-- **MOT PLAYER** — browses and plays `.motmodel` files, losslessly imports
-  compatible NAM A2 Nano models, adds the `INPUT GAIN`, `TIGHT`, and `BITE`
-  controls, and loads cabinet IRs.
-- **MOT TUNER** — the standalone chromatic strobe tuner for the Fender Studio
-  input channel.
+MOT TUNER is the only plug-in produced by this repository. Amplifier capture,
+training, model playback, and cabinet processing are intentionally out of
+scope; NAM model workflows are handled by NAM Gateway.
 
-The wrappers have independent VST3 class IDs, parameter/state schemas, DSP
-states, and single-page editors. Shared format-agnostic DSP and persistence
-live in the root `mot-core` crate.
+## Features
 
-## Workspace
+- Fast chromatic pitch detection with stable note latching.
+- Seven configurable reference notes for a seven-string guitar.
+- Independent per-string offsets in 0.1-cent steps.
+- One switch to compare configured offsets against equal temperament.
+- Large smooth strobe display with note and cents readout.
+- Optional output mute.
+- Bit-exact mono passthrough while unmuted.
+- Exactly `0 samples` of reported plug-in latency.
+- Native operation at 44.1, 48, 88.2, 96, and 192 kHz.
+- VST3 for macOS ARM64.
+
+The default tuning is `B1–E2–A2–D3–G3–B3–E4`. Plug-in identity and parameter
+IDs are kept stable so existing MOT TUNER instances remain compatible.
+
+## Repository
 
 ```text
 mot-core
-├── causal A2-C3 runtime
-├── model format and library
-├── zero-latency amp/cabinet path
-├── reference generation, recording, and alignment validation
-├── chromatic tuner
-└── optional Candle/Metal offline trainer
+└── chromatic pitch detector
 
 plugins/
-├── mot-trainer
-├── mot-player
-└── mot-tuner
+├── mot-tuner
+└── mot-ui
 ```
 
-Candle/Metal is enabled only for `mot-trainer`. Player inference remains a
-fixed native CPU implementation with no allocation, lock, I/O, lookahead, or
-hidden internal block in the audio callback.
-
-## Shared storage
-
-```text
-~/Library/Application Support/Plut&Mot/MOT Guitar Plugin/
-├── Capture Assets/
-│   ├── input.wav
-│   └── reference.wav
-├── Capture Records/
-├── IRs/
-├── Model Settings/
-└── Models/
-```
-
-The required excitation is NAM's canonical mono 48 kHz,
-9,120,000-sample `input.wav`:
-
-```text
-SHA-256 70f8ec7f25686a1bd77f25973de8e51a6721e957e81eec121822e5e53366bc41
-```
-
-Trainer verifies this exact asset and generates `reference.wav`, a
-DAW-ready file containing the pre-roll, synchronization header, excitation,
-tail, and alignment margin expected by its recorder. Use `SHOW IN FINDER` in
-Trainer, place that file on a mono DAW track, and render it through the
-reference chain with the DAW's plug-in delay compensation. Then play the
-aligned render through Trainer from its exact start. See
-[docs/capture-lab.md](docs/capture-lab.md).
-
-## Zero-latency Player
-
-- Mono, native 48 kHz.
-- Official causal NAM WaveNet A2-C3 shape: 1,870 trainable parameters.
-- Receptive field: 6,347 current/past samples; it is history, not latency.
-- VST3-reported latency: exactly `0 samples`.
-- IR maximum: 8192 samples.
-- IR head: direct 64-tap convolution.
-- IR tail: non-uniform partitioned convolution.
-- Default import: auto-trim + minimum phase.
-- RAW mode preserves phase and any delay embedded in the IR itself.
-- Missing/corrupt selected assets fail closed to safe mute.
-
-`IMPORT NAM…` accepts a direct WaveNet A2 Nano/C=3 model or extracts the
-compatible C=3 submodel from a modern NAM `SlimmableContainer`. Import is
-strict: the source must be 48 kHz and match the exact A2 configuration and
-official 1,871-value weight stream. LSTM, Linear, C8-only, and other WaveNet
-shapes are rejected instead of being silently reshaped into a different
-sound; those architectures require a future offline distillation path.
-Extracted container models carry a persistent `C3 Nano` suffix because a NAM
-host may select the container's C8 model by default. Source SHA-256, selected
-submodel, and original NAM metadata (including dBu calibration fields) are
-retained in an immutable adjacent `.nam-import.json` file. The Player does not
-apply physical dBu calibration automatically.
-
-## Trainer
-
-Training is real full-dataset optimization, not the removed one-second
-prototype. The control is `MAX PASSES`, 1–400, default 400. One pass is one
-complete traversal of the available training windows. A contiguous
-validation region selects the best checkpoint. A model is published only when
-held-out ESR is below `0.035`; failed captures and their WAVs remain available
-for diagnosis/retraining. The training input remains the verified canonical
-`input.wav`; the target is the mono 48 kHz WAV rendered or recorded by the
-DAW. Before publication, the exported native Player runtime is rendered over
-the held-out region and its ESR must agree with the training graph.
-
-The current loss is time-domain MSE. MRSTFT is not implemented. Training runs
-off the audio callback. Player inference is CPU-only and unaffected by trainer
-work.
+`mot-ui` is an internal UI support crate, not a separate plug-in.
 
 ## Build and install
 
@@ -114,8 +43,8 @@ Requirements: Apple Silicon macOS, stable Rust, and `cargo-truce` 6.3.
 cargo fmt --all -- --check
 cargo test --workspace --all-features
 cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo truce build --vst3
-cargo truce install --vst3 --user
+cargo truce build --vst3 -p mot-tuner
+cargo truce install --vst3 --user -p mot-tuner
 ```
 
 Release builds use optimization level 3, full LTO, and one codegen unit.
@@ -124,19 +53,10 @@ Release builds use optimization level 3, full LTO, and one codegen unit.
 
 ```bash
 cargo test --workspace --all-features
-cargo test --workspace --all-features --features rt-paranoid
-cargo truce validate --pluginval -p mot-trainer
-cargo truce validate --pluginval -p mot-player
 cargo truce validate --pluginval -p mot-tuner
 ```
 
-The core acceptance suite also covers sample-zero onset, arbitrary host block
-sizes, model/IR integrity, bit-exact transparent paths, RT allocation guards,
-capture alignment, and Tuner operation at common sample rates.
-
-## Scope
-
-Version 0.6 is a private laboratory build. Model playback and capture are
-fixed to mono/48 kHz. MOT TUNER alone intentionally supports the host's native
-44.1/48/88.2/96/192 kHz rates. Physical dBu calibration, stereo processing,
-AU wrappers, and a public installer are deferred.
+The test suite covers common sample rates, every semitone in the configured
+range, harmonic-rich decays, octave-error rejection, note acquisition and
+latching, cents polarity, offsets, bit-exact passthrough, mute/bypass behavior,
+zero latency, and headless editor rendering.

@@ -5,24 +5,6 @@ url = "https://plutandmot.local"
 au_manufacturer = "PMot"
 
 [[plugin]]
-name = "MOT TRAINER"
-bundle_id = "mot-trainer"
-crate = "mot-trainer"
-category = "tool"
-fourcc = "MTrn"
-au_tag = "Effects"
-vst3_subcategory = "Tools"
-
-[[plugin]]
-name = "MOT PLAYER"
-bundle_id = "mot-player"
-crate = "mot-player"
-category = "effect"
-fourcc = "MPly"
-au_tag = "Effects"
-vst3_subcategory = "Distortion"
-
-[[plugin]]
 name = "MOT TUNER"
 bundle_id = "mot-tuner"
 crate = "mot-tuner"

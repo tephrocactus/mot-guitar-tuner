@@ -9,7 +9,8 @@ use crate::{
     AssetLoadStatus, GeneratorParams, P, VERSION, arm_command_is_active, generator_can_arm,
 };
 
-pub(crate) const WINDOW_SIZE: (u32, u32) = (720, 300);
+pub(crate) const WINDOW_SIZE: (u32, u32) = (720, 320);
+const VERTICAL_GAP: f32 = 16.0;
 
 pub(crate) struct GeneratorUi;
 
@@ -45,7 +46,7 @@ impl EditorUi<GeneratorParams> for GeneratorUi {
                             .color(text_dim),
                     );
                 });
-                ui.add_space(16.0);
+                ui.add_space(VERTICAL_GAP);
 
                 egui::Frame::new()
                     .fill(panel)
@@ -67,7 +68,7 @@ impl EditorUi<GeneratorParams> for GeneratorUi {
                             );
                         });
 
-                        ui.add_space(14.0);
+                        ui.add_space(VERTICAL_GAP);
                         ui.horizontal(|ui| {
                             ui.label(RichText::new("SEND TRIM").color(text_dim));
                             let mut send_trim = context.send_trim.value();
@@ -90,7 +91,7 @@ impl EditorUi<GeneratorParams> for GeneratorUi {
                             }
                         });
 
-                        ui.add_space(18.0);
+                        ui.add_space(VERTICAL_GAP);
                         let normalized_status = context.get_meter(P::Status);
                         let ready = generator_can_arm(load_status, normalized_status);
                         let arm_command = context.arm_command.load(Ordering::Acquire);
@@ -132,7 +133,7 @@ impl EditorUi<GeneratorParams> for GeneratorUi {
                             context.arm_command.fetch_add(1, Ordering::AcqRel);
                         }
                         if armed && matches!(status_code, 0..=2) {
-                            ui.add_space(8.0);
+                            ui.add_space(VERTICAL_GAP);
                             ui.label(
                                 RichText::new(
                                     "Now click Play in a DAW's transport panel. Stop playback if already playing",
@@ -142,7 +143,7 @@ impl EditorUi<GeneratorParams> for GeneratorUi {
                         }
 
                         if armed {
-                            ui.add_space(18.0);
+                            ui.add_space(VERTICAL_GAP);
                             let progress = context.get_meter(P::Progress).clamp(0.0, 1.0);
                             ui.add(egui::ProgressBar::new(progress).show_percentage());
                         }

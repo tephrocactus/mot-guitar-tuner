@@ -427,6 +427,22 @@ impl TrainerRecorder {
         Ok(())
     }
 
+    /// Cancels an armed recording before the stopped-to-playing edge.
+    ///
+    /// Returns `true` only while the recorder is still waiting for transport.
+    /// Once recording has started, transport rules remain authoritative.
+    pub fn disarm(&mut self) -> bool {
+        if matches!(
+            self.clock.status,
+            ClockStatus::Armed | ClockStatus::WaitingForTransport
+        ) {
+            self.clock.reset();
+            true
+        } else {
+            false
+        }
+    }
+
     /// Explicit control/worker-thread reset between attempts.
     ///
     /// Clearing a multi-minute capture buffer is intentionally excluded from
@@ -879,6 +895,22 @@ mod tests {
         assert!(output.iter().all(|sample| *sample == 0.0));
         assert_eq!(generator.state(), SplitCaptureState::Idle);
         assert!(!generator.disarm());
+    }
+
+    #[test]
+    fn trainer_can_disarm_before_transport_starts() {
+        let mut trainer = TrainerRecorder::new(program(), CAPTURE_SAMPLE_RATE_HZ).unwrap();
+        trainer.arm(false).unwrap();
+        trainer.process_block(&[0.0; 11], transport(false, START_TIMELINE));
+        assert_eq!(trainer.state(), SplitCaptureState::WaitingForTransport);
+
+        assert!(trainer.disarm());
+        assert_eq!(trainer.state(), SplitCaptureState::Idle);
+
+        trainer.process_block(&[0.5; 17], transport(true, START_TIMELINE));
+        assert_eq!(trainer.completed_samples(), 0);
+        assert_eq!(trainer.state(), SplitCaptureState::Idle);
+        assert!(!trainer.disarm());
     }
 
     #[test]

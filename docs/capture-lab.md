@@ -73,6 +73,11 @@ same verified asset and uses it directly as the training input; there is no
 manual gain value to synchronize between the plug-ins and the input is not
 normalized.
 
+Enter a new name in `MODEL`, or use its compact picker to reuse the name and
+available capture metadata from an existing model. The picker is a retraining
+template: training still creates a new immutable model and does not continue
+from the old neural weights.
+
 ## Hardware amplifier
 
 ```text

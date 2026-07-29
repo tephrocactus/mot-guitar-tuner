@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::cabinet::{CabinetIrImportOptions, MAX_IR_SAMPLES, PreparedCabinetIr};
+use crate::capture::CaptureTarget;
 use crate::model::{
     ModelError, ModelMetadata, ModelRef, ModelRuntimeLimits, MotModel, Sha256Digest, sha256,
 };
@@ -26,6 +27,7 @@ const APPLICATION_SUPPORT_RELATIVE: &str = "Library/Application Support/Plut&Mot
 const MODELS_DIRECTORY: &str = "Models";
 const MODEL_SETTINGS_DIRECTORY: &str = "Model Settings";
 const IRS_DIRECTORY: &str = "IRs";
+const CAPTURE_RECORDS_DIRECTORY: &str = "Capture Records";
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -34,6 +36,7 @@ pub struct ModelLibraryPaths {
     pub models: PathBuf,
     pub model_settings: PathBuf,
     pub irs: PathBuf,
+    pub capture_records: PathBuf,
 }
 
 impl ModelLibraryPaths {
@@ -50,6 +53,7 @@ impl ModelLibraryPaths {
             models: plugin_root.join(MODELS_DIRECTORY),
             model_settings: plugin_root.join(MODEL_SETTINGS_DIRECTORY),
             irs: plugin_root.join(IRS_DIRECTORY),
+            capture_records: plugin_root.join(CAPTURE_RECORDS_DIRECTORY),
             plugin_root,
         }
     }
@@ -77,6 +81,21 @@ pub struct ScanIssue {
 pub struct ModelScan {
     pub models: Vec<ModelEntry>,
     pub issues: Vec<ScanIssue>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TrainerCapturePreset {
+    pub model_id: String,
+    pub target: CaptureTarget,
+    pub amplifier: String,
+    pub amplifier_channel: String,
+    pub control_positions: String,
+    pub interface_output: String,
+    pub interface_input: String,
+    pub reamp_box: String,
+    pub reactive_load: String,
+    pub load_impedance_ohms: Option<u16>,
+    pub return_gain_note: String,
 }
 
 #[derive(Clone, Debug)]
@@ -270,6 +289,7 @@ impl ModelLibrary {
         fs::create_dir_all(&self.paths.models)?;
         fs::create_dir_all(&self.paths.model_settings)?;
         fs::create_dir_all(&self.paths.irs)?;
+        fs::create_dir_all(&self.paths.capture_records)?;
         Ok(())
     }
 
@@ -295,17 +315,55 @@ impl ModelLibrary {
                 }),
             }
         }
-        scan.models.sort_by(|left, right| {
-            left.metadata
-                .display_name
-                .to_lowercase()
-                .cmp(&right.metadata.display_name.to_lowercase())
-                .then_with(|| left.reference.model_id.cmp(&right.reference.model_id))
-                .then_with(|| left.path.cmp(&right.path))
-        });
-        scan.issues
-            .sort_by(|left, right| left.path.cmp(&right.path));
+        sort_model_scan(&mut scan);
         Ok(scan)
+    }
+
+    /// Scans valid model containers without applying the current Player
+    /// architecture policy. Trainer uses this metadata-only catalog to offer
+    /// older models as retraining presets even when their runtime architecture
+    /// is no longer supported by the current Player.
+    pub fn scan_catalog(&self) -> Result<ModelScan, LibraryError> {
+        let paths = collect_model_paths(&self.paths.models)?;
+        let mut scan = ModelScan::default();
+        for path in paths {
+            match MotModel::read(&path) {
+                Ok(model) => {
+                    let filename_hint = file_name_string(&path)?;
+                    scan.models.push(ModelEntry {
+                        path,
+                        reference: model.model_ref(filename_hint),
+                        metadata: model.metadata().clone(),
+                    });
+                }
+                Err(error) => scan.issues.push(ScanIssue {
+                    path,
+                    message: error.to_string(),
+                }),
+            }
+        }
+        sort_model_scan(&mut scan);
+        Ok(scan)
+    }
+
+    /// Loads editable Trainer metadata associated with an immutable model.
+    /// Missing capture records are valid for imported models.
+    pub fn load_trainer_capture_preset(
+        &self,
+        model_id: &str,
+    ) -> Result<Option<TrainerCapturePreset>, LibraryError> {
+        validate_identifier("model_id", model_id)?;
+        let path = self
+            .paths
+            .capture_records
+            .join(model_id)
+            .join("capture.json");
+        let json = match fs::read_to_string(path) {
+            Ok(json) => json,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(LibraryError::Io(error)),
+        };
+        capture_preset_from_json(&json, model_id).map(Some)
     }
 
     /// Scans the managed IR archive and verifies each RAW WAV against its
@@ -662,6 +720,7 @@ pub enum LibraryError {
     UnsupportedToneSettingsVersion(u32),
     InvalidIrImport(String),
     InvalidIrMetadata(String),
+    InvalidCaptureMetadata(String),
     ImmutableAssetCollision(PathBuf),
     ToneModelIdMismatch { expected: String, found: String },
     ToneModelHashMismatch { model_id: String },
@@ -691,6 +750,9 @@ impl fmt::Display for LibraryError {
             }
             Self::InvalidIrMetadata(message) => {
                 write!(formatter, "invalid cabinet IR metadata: {message}")
+            }
+            Self::InvalidCaptureMetadata(message) => {
+                write!(formatter, "invalid Trainer capture metadata: {message}")
             }
             Self::ImmutableAssetCollision(path) => {
                 write!(formatter, "immutable asset collision at {}", path.display())
@@ -753,6 +815,19 @@ fn read_validated_model(
     let model = MotModel::read(path)?;
     model.validate_for_runtime(limits)?;
     Ok(model)
+}
+
+fn sort_model_scan(scan: &mut ModelScan) {
+    scan.models.sort_by(|left, right| {
+        left.metadata
+            .display_name
+            .to_lowercase()
+            .cmp(&right.metadata.display_name.to_lowercase())
+            .then_with(|| left.reference.model_id.cmp(&right.reference.model_id))
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    scan.issues
+        .sort_by(|left, right| left.path.cmp(&right.path));
 }
 
 fn collect_model_paths(directory: &Path) -> Result<Vec<PathBuf>, LibraryError> {
@@ -1094,6 +1169,124 @@ fn tone_from_json(json: &str) -> Result<ToneSettings, LibraryError> {
         bite_percent,
         ir,
     })
+}
+
+fn capture_preset_from_json(
+    json: &str,
+    expected_model_id: &str,
+) -> Result<TrainerCapturePreset, LibraryError> {
+    let value = JsonParser::new(json)
+        .parse()
+        .map_err(|error| invalid_capture_metadata(error.to_string()))?;
+    let root = value
+        .as_object("capture root")
+        .map_err(|error| invalid_capture_metadata(error.to_string()))?;
+    let schema_version = capture_u32(root, "schema_version")?;
+    if !(1..=5).contains(&schema_version) {
+        return Err(invalid_capture_metadata(format!(
+            "unsupported schema version {schema_version}"
+        )));
+    }
+    let model_id = capture_required_string(root, "model_id")?;
+    if model_id != expected_model_id {
+        return Err(invalid_capture_metadata(format!(
+            "record belongs to model {model_id}, expected {expected_model_id}"
+        )));
+    }
+    let target = match capture_required_string(root, "target")?.as_str() {
+        "software_plugin_chain" => CaptureTarget::SoftwarePluginChain,
+        "full_amp_unfiltered_load" => CaptureTarget::FullAmpUnfilteredLoad,
+        value => {
+            return Err(invalid_capture_metadata(format!(
+                "unknown capture target {value:?}"
+            )));
+        }
+    };
+    let hardware = match root.get("hardware") {
+        Some(value) => value
+            .as_object("hardware")
+            .map_err(|error| invalid_capture_metadata(error.to_string()))?,
+        None => root,
+    };
+
+    Ok(TrainerCapturePreset {
+        model_id,
+        target,
+        amplifier: capture_optional_string(hardware, "amplifier")?,
+        amplifier_channel: capture_optional_string(hardware, "amplifier_channel")?,
+        control_positions: capture_optional_string(hardware, "control_positions")?,
+        interface_output: capture_optional_string(hardware, "interface_output")?,
+        interface_input: capture_optional_string(hardware, "interface_input")?,
+        reamp_box: capture_optional_string(hardware, "reamp_box")?,
+        reactive_load: capture_optional_string(hardware, "reactive_load")?,
+        load_impedance_ohms: capture_optional_u16(hardware, "load_impedance_ohms")?,
+        return_gain_note: capture_optional_string(hardware, "return_gain_note")?,
+    })
+}
+
+fn invalid_capture_metadata(message: impl Into<String>) -> LibraryError {
+    LibraryError::InvalidCaptureMetadata(message.into())
+}
+
+fn capture_required_string(
+    object: &BTreeMap<String, JsonValue>,
+    field: &str,
+) -> Result<String, LibraryError> {
+    match object.get(field) {
+        Some(JsonValue::String(value)) => Ok(value.clone()),
+        Some(_) => Err(invalid_capture_metadata(format!(
+            "{field} must be a string"
+        ))),
+        None => Err(invalid_capture_metadata(format!("{field} is missing"))),
+    }
+}
+
+fn capture_optional_string(
+    object: &BTreeMap<String, JsonValue>,
+    field: &str,
+) -> Result<String, LibraryError> {
+    match object.get(field) {
+        Some(JsonValue::String(value)) => Ok(value.clone()),
+        Some(JsonValue::Null) | None => Ok(String::new()),
+        Some(_) => Err(invalid_capture_metadata(format!(
+            "{field} must be a string or null"
+        ))),
+    }
+}
+
+fn capture_u32(object: &BTreeMap<String, JsonValue>, field: &str) -> Result<u32, LibraryError> {
+    match object.get(field) {
+        Some(JsonValue::Number(value))
+            if value.is_finite()
+                && value.fract() == 0.0
+                && (0.0..=f64::from(u32::MAX)).contains(value) =>
+        {
+            Ok(*value as u32)
+        }
+        Some(_) => Err(invalid_capture_metadata(format!(
+            "{field} must be an unsigned integer"
+        ))),
+        None => Err(invalid_capture_metadata(format!("{field} is missing"))),
+    }
+}
+
+fn capture_optional_u16(
+    object: &BTreeMap<String, JsonValue>,
+    field: &str,
+) -> Result<Option<u16>, LibraryError> {
+    match object.get(field) {
+        Some(JsonValue::Null) | None => Ok(None),
+        Some(JsonValue::Number(value))
+            if value.is_finite()
+                && value.fract() == 0.0
+                && (1.0..=f64::from(u16::MAX)).contains(value) =>
+        {
+            Ok(Some(*value as u16))
+        }
+        Some(_) => Err(invalid_capture_metadata(format!(
+            "{field} must be null or a positive 16-bit integer"
+        ))),
+    }
 }
 
 fn escape_json(value: &str) -> String {
@@ -1536,6 +1729,12 @@ mod tests {
             paths.irs,
             Path::new("/Users/example/Library/Application Support/Plut&Mot/MOT Guitar Plugin/IRs")
         );
+        assert_eq!(
+            paths.capture_records,
+            Path::new(
+                "/Users/example/Library/Application Support/Plut&Mot/MOT Guitar Plugin/Capture Records"
+            )
+        );
     }
 
     #[test]
@@ -1627,6 +1826,12 @@ mod tests {
             .unwrap()
             .write_new(library.paths().models.join("heavy.motmodel"))
             .unwrap();
+        let mut legacy = metadata("legacy", "Legacy");
+        legacy.architecture_id = "mot.diagonal-rnn-tanh".to_owned();
+        MotModel::new(legacy, vec![4])
+            .unwrap()
+            .write_new(library.paths().models.join("legacy.motmodel"))
+            .unwrap();
         fs::write(library.paths().models.join("bad.motmodel"), b"broken").unwrap();
         fs::write(library.paths().models.join("ignore.wav"), b"not a model").unwrap();
 
@@ -1637,7 +1842,7 @@ mod tests {
             .map(|entry| entry.reference.model_id.as_str())
             .collect();
         assert_eq!(ids, vec!["a-model", "z-model"]);
-        assert_eq!(scan.issues.len(), 2);
+        assert_eq!(scan.issues.len(), 3);
         assert!(
             scan.issues
                 .iter()
@@ -1648,6 +1853,89 @@ mod tests {
                 .iter()
                 .any(|issue| issue.path.ends_with("heavy.motmodel"))
         );
+
+        let catalog = library.scan_catalog().unwrap();
+        let catalog_ids: Vec<_> = catalog
+            .models
+            .iter()
+            .map(|entry| entry.reference.model_id.as_str())
+            .collect();
+        assert_eq!(
+            catalog_ids,
+            vec!["a-model", "expensive", "legacy", "z-model"]
+        );
+        assert_eq!(catalog.issues.len(), 1);
+    }
+
+    #[test]
+    fn trainer_capture_preset_reads_legacy_flat_metadata() {
+        let json = r#"{
+            "schema_version": 1,
+            "model_id": "amp-legacy",
+            "target": "software_plugin_chain",
+            "amplifier": "ПИВО 5153",
+            "amplifier_channel": "Red",
+            "control_positions": "Gain 6",
+            "interface_output": "Out 3",
+            "interface_input": "In 1",
+            "reamp_box": "Reamp",
+            "reactive_load": "Captor X",
+            "load_impedance_ohms": null,
+            "return_gain_note": "+12 dB"
+        }"#;
+        let preset = capture_preset_from_json(json, "amp-legacy").unwrap();
+
+        assert_eq!(preset.model_id, "amp-legacy");
+        assert_eq!(preset.target, CaptureTarget::SoftwarePluginChain);
+        assert_eq!(preset.amplifier, "ПИВО 5153");
+        assert_eq!(preset.amplifier_channel, "Red");
+        assert_eq!(preset.control_positions, "Gain 6");
+        assert_eq!(preset.interface_output, "Out 3");
+        assert_eq!(preset.interface_input, "In 1");
+        assert_eq!(preset.reamp_box, "Reamp");
+        assert_eq!(preset.reactive_load, "Captor X");
+        assert_eq!(preset.load_impedance_ohms, None);
+        assert_eq!(preset.return_gain_note, "+12 dB");
+    }
+
+    #[test]
+    fn trainer_capture_preset_reads_current_nested_metadata() {
+        let json = r#"{
+            "schema_version": 5,
+            "model_id": "amp-current",
+            "target": "full_amp_unfiltered_load",
+            "hardware": {
+                "amplifier": "EVH 5153",
+                "amplifier_channel": "Blue",
+                "control_positions": "Gain 5",
+                "interface_output": "Line 3",
+                "interface_input": "Input 1",
+                "reamp_box": "Radial",
+                "reactive_load": "Suhr",
+                "load_impedance_ohms": 8,
+                "return_gain_note": "Pad on"
+            }
+        }"#;
+        let preset = capture_preset_from_json(json, "amp-current").unwrap();
+
+        assert_eq!(preset.target, CaptureTarget::FullAmpUnfilteredLoad);
+        assert_eq!(preset.amplifier, "EVH 5153");
+        assert_eq!(preset.load_impedance_ohms, Some(8));
+        assert_eq!(preset.return_gain_note, "Pad on");
+    }
+
+    #[test]
+    fn trainer_capture_preset_rejects_the_wrong_model() {
+        let json = r#"{
+            "schema_version": 5,
+            "model_id": "other-model",
+            "target": "software_plugin_chain",
+            "hardware": {}
+        }"#;
+        assert!(matches!(
+            capture_preset_from_json(json, "expected-model"),
+            Err(LibraryError::InvalidCaptureMetadata(_))
+        ));
     }
 
     #[test]

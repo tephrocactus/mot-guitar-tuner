@@ -2,7 +2,7 @@ mod editor;
 
 use std::fs;
 use std::path::Path;
-use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -23,7 +23,7 @@ use mot_core::capture_asset::{
 use mot_core::model::{
     A2_ARCHITECTURE_ID, A2_ARCHITECTURE_VERSION, ModelMetadata, ModelRef, MotModel,
 };
-use mot_core::model_library::ModelLibrary;
+use mot_core::model_library::{ModelLibrary, TrainerCapturePreset};
 use mot_core::split_capture::{CompletedTrainerRecording, SplitCaptureState, TrainerRecorder};
 use mot_core::wav_io::write_mono_f32_wav;
 use truce::prelude::*;
@@ -35,6 +35,7 @@ pub(crate) const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const PREPARED_CAPACITY: usize = 2;
 const RETIRED_CAPACITY: usize = 4;
+const MODEL_SCAN_OUTCOME_CAPACITY: usize = 2;
 static NEXT_CAPTURE_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -302,6 +303,54 @@ impl TrainerControl {
     }
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct RetrainModel {
+    pub model_id: String,
+    pub display_name: String,
+    pub capture: Option<TrainerCapturePreset>,
+    pub metadata_error: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct TrainerModelControl {
+    busy: AtomicBool,
+    outcomes: ArrayQueue<Result<Vec<RetrainModel>, String>>,
+}
+
+impl Default for TrainerModelControl {
+    fn default() -> Self {
+        Self {
+            busy: AtomicBool::new(false),
+            outcomes: ArrayQueue::new(MODEL_SCAN_OUTCOME_CAPACITY),
+        }
+    }
+}
+
+impl TrainerModelControl {
+    pub(crate) fn try_begin(&self) -> bool {
+        self.busy
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    pub(crate) fn cancel_begin(&self) {
+        self.busy.store(false, Ordering::Release);
+    }
+
+    pub(crate) fn is_busy(&self) -> bool {
+        self.busy.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn take_outcome(&self) -> Option<Result<Vec<RetrainModel>, String>> {
+        self.outcomes.pop()
+    }
+
+    fn finish(&self, outcome: Result<Vec<RetrainModel>, String>) {
+        let _ = self.outcomes.force_push(outcome);
+        self.busy.store(false, Ordering::Release);
+    }
+}
+
 #[derive(Params)]
 pub struct MotTrainerParams {
     #[param(name = "Bypass", flags = "automatable | bypass")]
@@ -340,6 +389,8 @@ pub struct MotTrainerParams {
     pub arm_generation: AtomicU64,
     #[skip]
     pub prepare_generation: AtomicCell<u64>,
+    #[skip]
+    pub model_control: Arc<TrainerModelControl>,
 
     #[meter]
     pub capture_progress: MeterSlot,
@@ -350,6 +401,43 @@ pub struct MotTrainerParams {
 }
 
 pub(crate) use MotTrainerParamsParamId as P;
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ScanTrainerModelsTask;
+
+impl BackgroundTask for ScanTrainerModelsTask {
+    type Params = MotTrainerParams;
+    const SERIALIZED: bool = true;
+
+    fn run(self, params: &Self::Params) {
+        params.model_control.finish(scan_retrain_models());
+    }
+}
+
+fn scan_retrain_models() -> Result<Vec<RetrainModel>, String> {
+    let library = ModelLibrary::for_current_user().map_err(|error| error.to_string())?;
+    let scan = library.scan_catalog().map_err(|error| error.to_string())?;
+    Ok(scan
+        .models
+        .into_iter()
+        .map(
+            |entry| match library.load_trainer_capture_preset(&entry.reference.model_id) {
+                Ok(capture) => RetrainModel {
+                    model_id: entry.reference.model_id,
+                    display_name: entry.metadata.display_name,
+                    capture,
+                    metadata_error: None,
+                },
+                Err(error) => RetrainModel {
+                    model_id: entry.reference.model_id,
+                    display_name: entry.metadata.display_name,
+                    capture: None,
+                    metadata_error: Some(error.to_string()),
+                },
+            },
+        )
+        .collect())
+}
 
 #[derive(Clone, Copy, Debug)]
 struct PrepareTrainerTask {
@@ -542,12 +630,21 @@ impl PluginLogic for MotTrainer {
         if arm_generation != state.observed_arm_generation {
             state.observed_arm_generation = arm_generation;
             if let Some(recorder) = &mut state.recorder {
-                match recorder.arm(context.transport.playing) {
-                    Ok(()) => {
-                        state.recorder_active = true;
-                        params.control.set_status(TrainerStatus::Armed);
+                if state.recorder_active {
+                    if recorder.disarm() {
+                        state.recorder_active = false;
+                        params.control.set_capture_progress(0.0);
+                        params.control.set_return_peak(0.0);
+                        params.control.set_status(TrainerStatus::Ready);
                     }
-                    Err(_error) => params.control.set_status(TrainerStatus::Error),
+                } else {
+                    match recorder.arm(context.transport.playing) {
+                        Ok(()) => {
+                            state.recorder_active = true;
+                            params.control.set_status(TrainerStatus::Armed);
+                        }
+                        Err(error) => params.control.set_error(error.to_string()),
+                    }
                 }
             }
         }
@@ -1148,7 +1245,12 @@ pub(crate) fn write_lock_string(lock: &RwLock<String>, value: &str) {
 truce::plugin! {
     logic: MotTrainer,
     params: MotTrainerParams,
-    tasks: [PrepareTrainerTask, RetireRecorderTask, TrainRecordingTask],
+    tasks: [
+        ScanTrainerModelsTask,
+        PrepareTrainerTask,
+        RetireRecorderTask,
+        TrainRecordingTask
+    ],
 }
 
 truce::enable_rt_paranoid!();

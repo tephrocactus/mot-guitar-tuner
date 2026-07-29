@@ -6,7 +6,9 @@
 
 mod editor;
 
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::process::Command;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -134,9 +136,13 @@ impl RuntimeStatusControl {
 
 const IR_IMPORT_OUTCOME_CAPACITY: usize = 2;
 
+pub(crate) type PickFileFuture =
+    Pin<Box<dyn Future<Output = Option<rfd::FileHandle>> + Send + 'static>>;
+
 #[derive(Debug)]
 pub(crate) enum IrImportOutcome {
     Imported(Box<ImportedIr>),
+    Cancelled,
     Error(String),
 }
 
@@ -180,9 +186,8 @@ impl IrImportControl {
     }
 }
 
-#[derive(Debug)]
 pub(crate) struct ImportIrTask {
-    pub source: PathBuf,
+    pub picker: PickFileFuture,
 }
 
 impl BackgroundTask for ImportIrTask {
@@ -190,12 +195,15 @@ impl BackgroundTask for ImportIrTask {
     const SERIALIZED: bool = true;
 
     fn run(self, params: &Self::Params) {
-        let outcome = ModelLibrary::for_current_user()
-            .and_then(|library| library.import_ir(&self.source))
-            .map_or_else(
-                |error| IrImportOutcome::Error(error.to_string()),
-                |imported| IrImportOutcome::Imported(Box::new(imported)),
-            );
+        let outcome = match pollster::block_on(self.picker) {
+            Some(source) => ModelLibrary::for_current_user()
+                .and_then(|library| library.import_ir(source.path()))
+                .map_or_else(
+                    |error| IrImportOutcome::Error(error.to_string()),
+                    |imported| IrImportOutcome::Imported(Box::new(imported)),
+                ),
+            None => IrImportOutcome::Cancelled,
+        };
         params.ir_import_control.finish(outcome);
     }
 }
@@ -237,6 +245,9 @@ pub(crate) enum LibraryOutcome {
         request_id: u64,
         result: Result<Box<ImportedNam>, String>,
     },
+    NamImportCancelled {
+        request_id: u64,
+    },
     FolderOpened {
         request_id: u64,
         result: Result<(), String>,
@@ -250,6 +261,7 @@ impl LibraryOutcome {
             | Self::ToneLoaded { request_id, .. }
             | Self::ToneSaved { request_id, .. }
             | Self::NamImported { request_id, .. }
+            | Self::NamImportCancelled { request_id }
             | Self::FolderOpened { request_id, .. } => *request_id,
         }
     }
@@ -334,9 +346,6 @@ pub(crate) enum LibraryTaskOperation {
     SaveTone {
         model_reference: ModelRef,
         settings: ToneSettings,
-    },
-    ImportNam {
-        source: PathBuf,
     },
     OpenFolder,
 }
@@ -437,13 +446,6 @@ fn run_library_task(task: LibraryTask) -> LibraryOutcome {
                 result,
             }
         }
-        LibraryTaskOperation::ImportNam { source } => LibraryOutcome::NamImported {
-            request_id,
-            result: library
-                .import_nam(&source)
-                .map(Box::new)
-                .map_err(|error| error.to_string()),
-        },
         LibraryTaskOperation::OpenFolder => LibraryOutcome::FolderOpened {
             request_id,
             result: open_library_folder(&library),
@@ -477,14 +479,36 @@ fn library_unavailable_outcome(
             settings,
             result: Err(message),
         },
-        LibraryTaskOperation::ImportNam { .. } => LibraryOutcome::NamImported {
-            request_id,
-            result: Err(message),
-        },
         LibraryTaskOperation::OpenFolder => LibraryOutcome::FolderOpened {
             request_id,
             result: Err(message),
         },
+    }
+}
+
+pub(crate) struct ImportNamTask {
+    pub request_id: u64,
+    pub picker: PickFileFuture,
+}
+
+impl BackgroundTask for ImportNamTask {
+    type Params = MotPlayerParams;
+    const SERIALIZED: bool = true;
+
+    fn run(self, params: &Self::Params) {
+        let outcome = match pollster::block_on(self.picker) {
+            Some(source) => LibraryOutcome::NamImported {
+                request_id: self.request_id,
+                result: ModelLibrary::for_current_user()
+                    .and_then(|library| library.import_nam(source.path()))
+                    .map(Box::new)
+                    .map_err(|error| error.to_string()),
+            },
+            None => LibraryOutcome::NamImportCancelled {
+                request_id: self.request_id,
+            },
+        };
+        params.library_control.finish(outcome);
     }
 }
 
@@ -857,7 +881,7 @@ impl PluginLogic for MotPlayer {
 truce::plugin! {
     logic: MotPlayer,
     params: MotPlayerParams,
-    tasks: [LoadRuntimeTask, ImportIrTask, LibraryTask],
+    tasks: [LoadRuntimeTask, ImportIrTask, ImportNamTask, LibraryTask],
 }
 
 truce::enable_rt_paranoid!();
@@ -891,6 +915,36 @@ mod tests {
         if let Some((_, width, height)) = Editor::screenshot(&mut editor, erased) {
             assert_eq!((width, height), (WINDOW_SIZE.0 * 2, WINDOW_SIZE.1 * 2));
         }
+    }
+
+    #[test]
+    fn cancelling_async_file_pickers_releases_both_import_controls() {
+        let params = MotPlayerParams::new();
+
+        assert!(params.ir_import_control.try_begin());
+        ImportIrTask {
+            picker: Box::pin(async { None }),
+        }
+        .run(&params);
+        assert!(!params.ir_import_control.is_busy());
+        assert!(matches!(
+            params.ir_import_control.take_outcome(),
+            Some(IrImportOutcome::Cancelled)
+        ));
+
+        let request_id = params.library_control.try_begin().unwrap();
+        ImportNamTask {
+            request_id,
+            picker: Box::pin(async { None }),
+        }
+        .run(&params);
+        assert!(!params.library_control.is_busy());
+        assert!(matches!(
+            params.library_control.take_outcome(),
+            Some(LibraryOutcome::NamImportCancelled {
+                request_id: cancelled_id
+            }) if cancelled_id == request_id
+        ));
     }
 
     #[test]

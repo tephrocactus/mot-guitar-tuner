@@ -17,8 +17,9 @@ use mot_ui::{
 };
 
 use crate::{
-    ImportIrTask, IrImportOutcome, LibraryOutcome, LibraryTask, LibraryTaskOperation,
-    MotPlayerParams, P, RuntimeUiState, read_shared_string, write_shared_string,
+    ImportIrTask, ImportNamTask, IrImportOutcome, LibraryOutcome, LibraryTask,
+    LibraryTaskOperation, MotPlayerParams, P, RuntimeUiState, read_shared_string,
+    write_shared_string,
 };
 
 pub(crate) const WINDOW_SIZE: (u32, u32) = (1_180, 760);
@@ -215,6 +216,50 @@ fn submit_library_task(
     Ok(())
 }
 
+fn submit_nam_import_picker(context: &PluginContext<MotPlayerParams>) -> Result<(), String> {
+    let Some(spawner) = context.tasks::<ImportNamTask>() else {
+        return Err("NAM import worker is unavailable in this host".to_owned());
+    };
+    let request_id = context
+        .library_control
+        .try_begin()
+        .ok_or_else(|| "A model-library operation is already running".to_owned())?;
+    let picker = Box::pin(
+        rfd::AsyncFileDialog::new()
+            .add_filter("Neural Amp Modeler", &["nam", "NAM"])
+            .set_title("Import NAM Model")
+            .pick_file(),
+    );
+    if spawner
+        .try_spawn(ImportNamTask { request_id, picker })
+        .is_err()
+    {
+        context.library_control.cancel_begin(request_id);
+        return Err("NAM import worker queue is full".to_owned());
+    }
+    Ok(())
+}
+
+fn submit_ir_import_picker(context: &PluginContext<MotPlayerParams>) -> Result<(), String> {
+    let Some(spawner) = context.tasks::<ImportIrTask>() else {
+        return Err("IR import worker is unavailable in this host".to_owned());
+    };
+    if !context.ir_import_control.try_begin() {
+        return Err("An IR import is already running".to_owned());
+    }
+    let picker = Box::pin(
+        rfd::AsyncFileDialog::new()
+            .add_filter("WAV audio", &["wav", "WAV"])
+            .set_title("Import Cabinet IR")
+            .pick_file(),
+    );
+    if spawner.try_spawn(ImportIrTask { picker }).is_err() {
+        context.ir_import_control.cancel_begin();
+        return Err("IR import worker queue is full".to_owned());
+    }
+    Ok(())
+}
+
 fn poll_library_outcomes(state: &mut EditorState, context: &PluginContext<MotPlayerParams>) {
     while let Some(outcome) = context.library_control.take_outcome() {
         if !context.library_control.is_current(outcome.request_id()) {
@@ -241,6 +286,7 @@ fn poll_library_outcomes(state: &mut EditorState, context: &PluginContext<MotPla
             LibraryOutcome::NamImported { result, .. } => {
                 apply_nam_import_outcome(state, context, result);
             }
+            LibraryOutcome::NamImportCancelled { .. } => state.message = None,
             LibraryOutcome::FolderOpened { result, .. } => match result {
                 Ok(()) => state.message = None,
                 Err(error) => state.message = Some(error),
@@ -364,6 +410,7 @@ fn poll_ir_import_outcome(state: &mut EditorState, context: &PluginContext<MotPl
                     imported.metadata.default_trim_leading_samples
                 ));
             }
+            IrImportOutcome::Cancelled => state.message = None,
             IrImportOutcome::Error(error) => state.message = Some(error),
         }
     }
@@ -485,13 +532,10 @@ fn model_browser(
             })
             .inner
             .clicked()
-            && let Some(source) = rfd::FileDialog::new()
-                .add_filter("Neural Amp Modeler", &["nam", "NAM"])
-                .pick_file()
         {
-            match submit_library_task(context, LibraryTaskOperation::ImportNam { source }) {
+            match submit_nam_import_picker(context) {
                 Ok(()) => {
-                    state.message = Some("Validating and converting the NAM model…".to_owned());
+                    state.message = Some("Choose a NAM model to import…".to_owned());
                 }
                 Err(error) => state.message = Some(error),
             }
@@ -834,26 +878,14 @@ fn ir_section(
                 });
 
             let busy = context.ir_import_control.is_busy();
-            if ui.add_enabled(!busy, ghost_button("IMPORT…")).clicked()
-                && let Some(source) = rfd::FileDialog::new()
-                    .add_filter("WAV audio", &["wav", "WAV"])
-                    .pick_file()
-            {
-                if !context.ir_import_control.try_begin() {
-                    state.message = Some("An IR import is already running".to_owned());
-                } else if let Some(spawner) = context.tasks::<ImportIrTask>() {
-                    match spawner.try_spawn(ImportIrTask { source }) {
-                        Ok(()) => {
-                            state.message = Some("Importing IR in the background…".to_owned());
-                        }
-                        Err(_) => {
-                            context.ir_import_control.cancel_begin();
-                            state.message = Some("IR import worker queue is full".to_owned());
-                        }
+            if ui.add_enabled(!busy, ghost_button("IMPORT…")).clicked() {
+                match submit_ir_import_picker(context) {
+                    Ok(()) => {
+                        state.message = Some("Choose a WAV cabinet IR to import…".to_owned());
                     }
-                } else {
-                    context.ir_import_control.cancel_begin();
-                    state.message = Some("IR import worker is unavailable in this host".to_owned());
+                    Err(error) => {
+                        state.message = Some(error);
+                    }
                 }
             }
             if ui.add(ghost_button("REFRESH")).clicked() {

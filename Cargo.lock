@@ -1529,12 +1529,13 @@ dependencies = [
 
 [[package]]
 name = "mot-player"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "crossbeam-queue",
  "egui",
  "mot-core",
  "mot-ui",
+ "pollster",
  "rfd",
  "truce",
  "truce-egui",

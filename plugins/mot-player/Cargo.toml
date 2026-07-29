@@ -1,6 +1,6 @@
 [package]
 name = "mot-player"
-version = "0.6.0"
+version = "0.6.1"
 edition = "2024"
 
 [lib]
@@ -20,4 +20,5 @@ truce-egui = { version = "6.3" }
 truce-vst3 = { version = "6.3", optional = true }
 egui = "0.34"
 crossbeam-queue = "0.3"
+pollster = "0.4"
 rfd = { version = "0.15", default-features = false }

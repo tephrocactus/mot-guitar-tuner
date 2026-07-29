@@ -5,15 +5,6 @@ url = "https://plutandmot.local"
 au_manufacturer = "PMot"
 
 [[plugin]]
-name = "MOT GENERATOR"
-bundle_id = "mot-generator"
-crate = "mot-generator"
-category = "tool"
-fourcc = "MGen"
-au_tag = "Effects"
-vst3_subcategory = "Tools"
-
-[[plugin]]
 name = "MOT TRAINER"
 bundle_id = "mot-trainer"
 crate = "mot-trainer"

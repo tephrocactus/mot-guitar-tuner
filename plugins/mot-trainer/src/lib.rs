@@ -14,11 +14,12 @@ use mot_core::a2_train::{
 };
 use mot_core::capture::{
     CAPTURE_SAMPLE_RATE_HZ, CalibrationStatus, CaptureTarget, HardwareCaptureMetadata,
-    RETURN_CLIP_THRESHOLD_LINEAR, TransportInfo, extract_aligned_excitation, linear_to_dbfs,
-    measure_alignment,
+    RETURN_CLIP_THRESHOLD_LINEAR, TransportInfo, extract_excitation_at_latency, linear_to_dbfs,
+    measure_alignment, resolve_training_alignment,
 };
 use mot_core::capture_asset::{
-    CAPTURE_ASSET_SHA256, CAPTURE_PROTOCOL_VERSION, load_default_capture_program,
+    CAPTURE_ASSET_SHA256, CAPTURE_PROTOCOL_VERSION, ensure_daw_reference_asset,
+    load_default_capture_program,
 };
 use mot_core::model::{
     A2_ARCHITECTURE_ID, A2_ARCHITECTURE_VERSION, ModelMetadata, ModelRef, MotModel,
@@ -454,7 +455,8 @@ impl BackgroundTask for PrepareTrainerTask {
         if params.prepare_generation.load() != self.generation {
             return;
         }
-        let result = load_default_capture_program()
+        let result = ensure_daw_reference_asset()
+            .and_then(|_| load_default_capture_program())
             .and_then(|program| {
                 TrainerRecorder::new(program, self.sample_rate_hz).map_err(|e| e.to_string())
             })
@@ -910,11 +912,19 @@ fn train_and_publish(
 
     let program = load_default_capture_program()?;
     ensure_training_active(control, generation, Some(&capture_dir))?;
-    let alignment = measure_alignment(&program, recording.audio(), recording.alignment_config())
-        .map_err(|error| error.to_string())?;
+    let measured_alignment =
+        measure_alignment(&program, recording.audio(), recording.alignment_config())
+            .map_err(|error| error.to_string())?;
+    let training_alignment =
+        resolve_training_alignment(capture_metadata.target, measured_alignment)
+            .map_err(|error| error.to_string())?;
     ensure_training_active(control, generation, Some(&capture_dir))?;
-    let target = extract_aligned_excitation(&program, recording.audio(), alignment)
-        .map_err(|error| error.to_string())?;
+    let target = extract_excitation_at_latency(
+        &program,
+        recording.audio(),
+        training_alignment.applied_training_shift_samples,
+    )
+    .map_err(|error| error.to_string())?;
     let emitted = program.excitation().to_vec();
     write_mono_f32_wav(
         &capture_dir.join("emitted.wav"),
@@ -930,7 +940,8 @@ fn train_and_publish(
     .map_err(|error| error.to_string())?;
     ensure_training_active(control, generation, Some(&capture_dir))?;
 
-    capture_metadata.measured_latency_samples = Some(alignment.fractional_latency_samples);
+    capture_metadata.sync_peak_lag_samples =
+        Some(training_alignment.measured.fractional_latency_samples);
     capture_metadata.return_peak_dbfs = Some(linear_to_dbfs(recording.peak_linear()));
     capture_metadata.return_rms_dbfs = Some(linear_to_dbfs(recording.rms_linear()));
 
@@ -959,8 +970,9 @@ fn train_and_publish(
         &capture_dir,
         &model_id,
         timestamp,
-        alignment.fractional_latency_samples,
-        alignment.normalized_correlation,
+        training_alignment.measured.fractional_latency_samples,
+        training_alignment.applied_training_shift_samples,
+        training_alignment.measured.normalized_correlation,
         &capture_metadata,
         &outcome,
     )?;
@@ -1041,7 +1053,8 @@ fn write_capture_record(
     capture_dir: &Path,
     model_id: &str,
     timestamp: u64,
-    latency_samples: f64,
+    measured_latency_samples: f64,
+    applied_latency_samples: f64,
     correlation: f64,
     metadata: &HardwareCaptureMetadata,
     outcome: &A2TrainingOutcome,
@@ -1049,7 +1062,8 @@ fn write_capture_record(
     let json = capture_record_json(
         model_id,
         timestamp,
-        latency_samples,
+        measured_latency_samples,
+        applied_latency_samples,
         correlation,
         metadata,
         outcome,
@@ -1060,13 +1074,15 @@ fn write_capture_record(
 fn capture_record_json(
     model_id: &str,
     timestamp: u64,
-    latency_samples: f64,
+    measured_latency_samples: f64,
+    applied_latency_samples: f64,
     correlation: f64,
     metadata: &HardwareCaptureMetadata,
     outcome: &A2TrainingOutcome,
 ) -> Result<String, String> {
     for (name, value) in [
-        ("fractional_latency_samples", latency_samples),
+        ("sync_peak_lag_samples", measured_latency_samples),
+        ("applied_training_shift_samples", applied_latency_samples),
         ("sync_correlation", correlation),
         ("validation_esr", outcome.quality.validation_esr),
         ("validation_esr_db", outcome.quality.validation_esr_db),
@@ -1091,6 +1107,10 @@ fn capture_record_json(
     let target = match metadata.target {
         CaptureTarget::SoftwarePluginChain => "software_plugin_chain",
         CaptureTarget::FullAmpUnfilteredLoad => "full_amp_unfiltered_load",
+    };
+    let alignment_policy = match metadata.target {
+        CaptureTarget::SoftwarePluginChain => "transport_synchronized",
+        CaptureTarget::FullAmpUnfilteredLoad => "round_trip_correlation",
     };
     let calibration_status = match metadata.calibration_status {
         CalibrationStatus::Uncalibrated => "uncalibrated",
@@ -1117,13 +1137,15 @@ fn capture_record_json(
     let json = format!(
         concat!(
             "{{\n",
-            "  \"schema_version\": 5,\n",
+            "  \"schema_version\": 6,\n",
             "  \"capture_protocol_version\": {},\n",
             "  \"model_id\": {},\n",
             "  \"created_unix_seconds\": {},\n",
             "  \"target\": \"{}\",\n",
             "  \"sample_rate_hz\": {},\n",
-            "  \"fractional_latency_samples\": {:.8},\n",
+            "  \"sync_peak_lag_samples\": {:.8},\n",
+            "  \"applied_training_shift_samples\": {:.8},\n",
+            "  \"alignment_policy\": \"{}\",\n",
             "  \"sync_correlation\": {:.8},\n",
             "  \"return_peak_dbfs\": {},\n",
             "  \"return_rms_dbfs\": {},\n",
@@ -1165,7 +1187,9 @@ fn capture_record_json(
         timestamp,
         target,
         metadata.sample_rate_hz,
-        latency_samples,
+        measured_latency_samples,
+        applied_latency_samples,
+        alignment_policy,
         correlation,
         return_peak_dbfs,
         return_rms_dbfs,
@@ -1524,14 +1548,25 @@ mod tests {
             elapsed_seconds: 901.5,
         };
 
-        let json = capture_record_json("capture-\"id", 123, 47.25, 0.987_654, &metadata, &outcome)
-            .unwrap();
+        let json = capture_record_json(
+            "capture-\"id",
+            123,
+            47.25,
+            47.25,
+            0.987_654,
+            &metadata,
+            &outcome,
+        )
+        .unwrap();
 
         for expected in [
-            "\"schema_version\": 5",
+            "\"schema_version\": 6",
             "\"capture_protocol_version\": 2",
             "\"model_id\": \"capture-\\\"id\"",
             "\"target\": \"full_amp_unfiltered_load\"",
+            "\"sync_peak_lag_samples\": 47.25000000",
+            "\"applied_training_shift_samples\": 47.25000000",
+            "\"alignment_policy\": \"round_trip_correlation\"",
             "\"input_level_dbu\": null",
             "\"output_level_dbu\": null",
             "\"amplifier\": \"EVH \\\"Stealth\\\"\\n100W\"",
@@ -1558,16 +1593,48 @@ mod tests {
             assert!(json.contains(expected), "missing {expected} in:\n{json}");
         }
         assert!(!json.contains("source_send_trim_db"));
+
+        metadata.target = CaptureTarget::SoftwarePluginChain;
+        let software_json = capture_record_json(
+            "software-chain",
+            124,
+            33.586_470_69,
+            0.0,
+            0.410_521_76,
+            &metadata,
+            &outcome,
+        )
+        .unwrap();
+        for expected in [
+            "\"target\": \"software_plugin_chain\"",
+            "\"sync_peak_lag_samples\": 33.58647069",
+            "\"applied_training_shift_samples\": 0.00000000",
+            "\"alignment_policy\": \"transport_synchronized\"",
+        ] {
+            assert!(
+                software_json.contains(expected),
+                "missing {expected} in:\n{software_json}"
+            );
+        }
     }
 
     #[test]
     fn editor_has_a_headless_render_path() {
         let params = Arc::new(MotTrainerParams::new());
+        params.control.set_status(TrainerStatus::Ready);
         let mut editor = EguiEditor::with_ui(Arc::clone(&params), WINDOW_SIZE, MotTrainerUi);
         let erased: Arc<dyn truce::params::Params> = params;
         assert_eq!(Editor::size(&editor), WINDOW_SIZE);
-        if let Some((_, width, height)) = Editor::screenshot(&mut editor, erased) {
+        if let Some((pixels, width, height)) = Editor::screenshot(&mut editor, erased) {
             assert_eq!((width, height), (WINDOW_SIZE.0 * 2, WINDOW_SIZE.1 * 2));
+            if let Ok(path) = std::env::var("MOT_TRAINER_SCREENSHOT_OUT") {
+                truce::core::screenshot::save_png(
+                    std::path::Path::new(&path),
+                    &pixels,
+                    width,
+                    height,
+                );
+            }
         }
     }
 }

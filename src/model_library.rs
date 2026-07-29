@@ -1182,7 +1182,7 @@ fn capture_preset_from_json(
         .as_object("capture root")
         .map_err(|error| invalid_capture_metadata(error.to_string()))?;
     let schema_version = capture_u32(root, "schema_version")?;
-    if !(1..=5).contains(&schema_version) {
+    if !(1..=6).contains(&schema_version) {
         return Err(invalid_capture_metadata(format!(
             "unsupported schema version {schema_version}"
         )));
@@ -1901,7 +1901,7 @@ mod tests {
     #[test]
     fn trainer_capture_preset_reads_current_nested_metadata() {
         let json = r#"{
-            "schema_version": 5,
+            "schema_version": 6,
             "model_id": "amp-current",
             "target": "full_amp_unfiltered_load",
             "hardware": {

@@ -1,6 +1,6 @@
 //! Format-agnostic DSP and persistence shared by the MOT guitar plug-ins.
 //!
-//! This crate deliberately exports no VST3 factory. The four products under
+//! This crate deliberately exports no VST3 factory. The three products under
 //! `plugins/` each own one wrapper, one parameter schema, and one editor.
 
 pub mod a2;

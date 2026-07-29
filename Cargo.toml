@@ -8,10 +8,14 @@ autobins = false
 path = "src/core.rs"
 crate-type = ["rlib"]
 
+[[example]]
+name = "a2_capture_smoke"
+path = "examples/a2_capture_smoke.rs"
+required-features = ["training"]
+
 [workspace]
 members = [
     "plugins/mot-ui",
-    "plugins/mot-generator",
     "plugins/mot-trainer",
     "plugins/mot-player",
     "plugins/mot-tuner",

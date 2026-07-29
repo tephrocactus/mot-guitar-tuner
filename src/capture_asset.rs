@@ -1,22 +1,31 @@
-//! Canonical excitation asset shared by MOT Generator and MOT Trainer.
+//! Canonical excitation assets used by MOT Trainer.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Arc, OnceLock};
 
-use crate::capture::CaptureProgram;
+use crate::capture::{
+    CaptureProgram, DEFAULT_MAX_ALIGNMENT_LAG_SAMPLES, PRE_ROLL_SAMPLES, TAIL_SAMPLES,
+};
 use crate::model::{Sha256Digest, sha256};
 use crate::model_library::ModelLibrary;
-use crate::wav_io::decode_mono_wav;
+use crate::wav_io::{decode_mono_wav, write_mono_f32_wav};
 
 pub const CAPTURE_ASSET_RELATIVE_PATH: &str = "Capture Assets/input.wav";
+pub const DAW_REFERENCE_ASSET_FILENAME: &str = "reference.wav";
+pub const DAW_REFERENCE_ASSET_RELATIVE_PATH: &str = "Capture Assets/reference.wav";
 pub const CAPTURE_ASSET_SHA256: &str =
     "70f8ec7f25686a1bd77f25973de8e51a6721e957e81eec121822e5e53366bc41";
 pub const CAPTURE_ASSET_SAMPLE_RATE_HZ: u32 = 48_000;
 pub const CAPTURE_ASSET_SAMPLES: usize = 9_120_000;
 pub const SYNC_HEADER_SAMPLES: usize = 4_096;
 pub const CAPTURE_PROTOCOL_VERSION: u32 = 2;
+pub const DAW_REFERENCE_ASSET_SAMPLES: usize = PRE_ROLL_SAMPLES
+    + SYNC_HEADER_SAMPLES
+    + CAPTURE_ASSET_SAMPLES
+    + TAIL_SAMPLES
+    + DEFAULT_MAX_ALIGNMENT_LAG_SAMPLES;
 
 static CAPTURE_PROGRAM: OnceLock<Arc<CaptureProgram>> = OnceLock::new();
 
@@ -26,6 +35,38 @@ pub fn capture_asset_path() -> Result<PathBuf, String> {
         .paths()
         .plugin_root
         .join(CAPTURE_ASSET_RELATIVE_PATH))
+}
+
+pub fn daw_reference_asset_path() -> Result<PathBuf, String> {
+    let library = ModelLibrary::for_current_user().map_err(|error| error.to_string())?;
+    Ok(library
+        .paths()
+        .plugin_root
+        .join(DAW_REFERENCE_ASSET_RELATIVE_PATH))
+}
+
+/// Ensures the DAW-ready reference exists off the audio thread.
+///
+/// Unlike canonical NAM `input.wav`, this file includes the exact pre-roll,
+/// sync header, tail, and alignment margin expected by
+/// [`crate::split_capture::TrainerRecorder`].
+/// It replaces a dedicated source plug-in with an ordinary audio item that
+/// the DAW can place and render using its own plug-in delay compensation.
+pub fn ensure_daw_reference_asset() -> Result<PathBuf, String> {
+    let path = daw_reference_asset_path()?;
+    let expected_bytes = 44_u64 + DAW_REFERENCE_ASSET_SAMPLES as u64 * 4;
+    if fs::metadata(&path)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.len() == expected_bytes)
+    {
+        return Ok(path);
+    }
+
+    let program = load_default_capture_program()?;
+    let mut samples = program.exact_source_stream();
+    samples.resize(DAW_REFERENCE_ASSET_SAMPLES, 0.0);
+    write_mono_f32_wav(&path, CAPTURE_ASSET_SAMPLE_RATE_HZ, &samples)
+        .map_err(|error| format!("cannot create DAW reference {}: {error}", path.display()))?;
+    Ok(path)
 }
 
 pub fn load_default_capture_program() -> Result<Arc<CaptureProgram>, String> {
@@ -93,5 +134,17 @@ mod tests {
         assert_eq!(left.len(), SYNC_HEADER_SAMPLES);
         assert_eq!(left[0], 0.0);
         assert_eq!(*left.last().expect("header sample"), 0.0);
+    }
+
+    #[test]
+    fn daw_reference_length_matches_the_trainer_recording_window() {
+        assert_eq!(
+            DAW_REFERENCE_ASSET_SAMPLES,
+            PRE_ROLL_SAMPLES
+                + SYNC_HEADER_SAMPLES
+                + CAPTURE_ASSET_SAMPLES
+                + TAIL_SAMPLES
+                + DEFAULT_MAX_ALIGNMENT_LAG_SAMPLES
+        );
     }
 }

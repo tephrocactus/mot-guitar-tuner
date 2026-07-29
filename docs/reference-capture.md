@@ -24,8 +24,9 @@ repository.
 
 ## Software reamp session
 
-1. Create a 48 kHz session and import `input.wav` without sample-rate
-   conversion, stretching, fades, normalization, clip gain, or level changes.
+1. Open MOT Trainer and use `SHOW IN FINDER` to reveal `reference.wav`.
+   Import that file into a 48 kHz session without sample-rate conversion,
+   stretching, fades, normalization, clip gain, or level changes.
 2. Route the file at unity gain through exactly one instance of the selected
    reference amp plugin.
 3. Disable the input gate, drive pedals, cabinet, room, modulation, delay,
@@ -33,9 +34,10 @@ repository.
    the amp/power-amp section only.
 4. Keep the chosen amp type, controls, input calibration, quality mode, and
    plugin version fixed. Save the preset alongside the rendered file.
-5. Render mono, 48 kHz, 24-bit WAV from the exact start of `input.wav`, with no
-   normalization, added tail, or loudness processing. Preserve the complete
-   190-second length, including the alignment impulses and trailing silence.
+5. Render mono at 48 kHz from the exact start of `reference.wav`, with no
+   normalization, added tail, or loudness processing. Preserve its complete
+   9,292,096-sample / 193.585333-second window, including pre-roll, sync
+   header, excitation, tail, and alignment margin.
 6. Name the result `pasadena_amp_only.wav`.
 
 The output must not contain clipped samples (`abs(sample) >= 1.0`). If level
@@ -46,8 +48,10 @@ For listening comparisons, a second render may include the preferred cabinet
 and be named `pasadena_full_reference.wav`. It is not used as the input to the
 separate MOT cabinet stage.
 
-Before fitting or training, validate matching sample rate, channel count,
-duration, absence of clipping, and sample alignment.
+Place MOT Trainer on the aligned render, return the playhead to the exact item
+start, arm Trainer while transport is stopped, and press Play. Before
+training, validate matching sample rate, channel count, duration, absence of
+clipping, and sample alignment.
 
 ## Asset policy
 

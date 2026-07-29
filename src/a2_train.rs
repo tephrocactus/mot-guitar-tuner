@@ -13,9 +13,9 @@
 //!   432,000 samples;
 //! - output-only joint normalization to -18 dBFS, undone in the exported
 //!   `head_scale`;
-//! - shuffled, drop-last batches of 16 × 8,192 output samples, AdamW at
-//!   0.004 with
-//!   weight decay 3.17e-7, and an exponential 0.994 learning-rate schedule;
+//! - shuffled, drop-last batches of 16 × 8,192 output samples, PyTorch-style
+//!   Adam at 0.004 with coupled L2 weight decay 3.17e-7, and an exponential
+//!   0.994 learning-rate schedule;
 //! - best checkpoint selected by validation error-signal ratio (ESR).
 //!
 //! NAM also adds multi-resolution STFT loss at weight 0.0005.  Candle does not
@@ -30,8 +30,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
-use candle_core::{DType, Device, Tensor};
-use candle_nn::{AdamW, Conv1d, Conv1dConfig, Init, Module, Optimizer, ParamsAdamW, VarMap};
+use candle_core::{DType, Device, Tensor, Var, backprop::GradStore};
+use candle_nn::{Conv1d, Conv1dConfig, Init, Module, Optimizer, VarMap};
 
 use crate::a2::{
     A2_CHANNELS, A2_DILATIONS, A2_HEAD_KERNEL_SIZE, A2_HEAD_SCALE, A2_KERNEL_SIZES, A2_LAYER_COUNT,
@@ -45,7 +45,7 @@ pub const A2_DEFAULT_BATCH_SIZE: usize = 16;
 pub const A2_DEFAULT_OUTPUT_SAMPLES: usize = 8_192;
 pub const A2_DEFAULT_MAX_EPOCHS: u32 = 400;
 pub const A2_INITIAL_LEARNING_RATE: f64 = 0.004;
-pub const A2_ADAMW_WEIGHT_DECAY: f64 = 3.17e-7;
+pub const A2_ADAM_WEIGHT_DECAY: f64 = 3.17e-7;
 pub const A2_LEARNING_RATE_GAMMA: f64 = 0.994;
 pub const A2_OUTPUT_NORMALIZATION_DBFS: f64 = -18.0;
 pub const A2_MRSTFT_WEIGHT: f64 = 0.0005;
@@ -55,6 +55,115 @@ pub const A2_TRAINABLE_PARAMETER_COUNT: usize = 1_870;
 const A2_RECEPTIVE_LOOKBACK: usize = A2_RECEPTIVE_FIELD_SAMPLES - 1;
 const A2_RECEPTIVE_FIELD_WITHOUT_HEAD: usize =
     A2_RECEPTIVE_FIELD_SAMPLES - (A2_HEAD_KERNEL_SIZE - 1);
+
+/// Parameters for NAM's PyTorch `torch.optim.Adam` recipe.
+///
+/// PyTorch's Adam applies `weight_decay * parameter` to the gradient before
+/// updating either moment. This is coupled L2 regularization and is
+/// intentionally different from Candle's decoupled `AdamW`.
+#[derive(Clone, Copy, Debug)]
+struct CoupledAdamConfig {
+    learning_rate: f64,
+    beta1: f64,
+    beta2: f64,
+    epsilon: f64,
+    weight_decay: f64,
+}
+
+#[derive(Debug)]
+struct CoupledAdamVariable {
+    parameter: Var,
+    first_moment: Var,
+    second_moment: Var,
+}
+
+#[derive(Debug)]
+struct CoupledAdam {
+    variables: Vec<CoupledAdamVariable>,
+    step: usize,
+    config: CoupledAdamConfig,
+}
+
+impl Optimizer for CoupledAdam {
+    type Config = CoupledAdamConfig;
+
+    fn new(variables: Vec<Var>, config: Self::Config) -> candle_core::Result<Self> {
+        let variables = variables
+            .into_iter()
+            .filter(|variable| variable.dtype().is_float())
+            .map(|parameter| {
+                let first_moment =
+                    Var::zeros(parameter.shape(), parameter.dtype(), parameter.device())?;
+                let second_moment =
+                    Var::zeros(parameter.shape(), parameter.dtype(), parameter.device())?;
+                Ok(CoupledAdamVariable {
+                    parameter,
+                    first_moment,
+                    second_moment,
+                })
+            })
+            .collect::<candle_core::Result<Vec<_>>>()?;
+        Ok(Self {
+            variables,
+            step: 0,
+            config,
+        })
+    }
+
+    fn step(&mut self, gradients: &GradStore) -> candle_core::Result<()> {
+        self.step += 1;
+        let CoupledAdamConfig {
+            learning_rate,
+            beta1,
+            beta2,
+            epsilon,
+            weight_decay,
+        } = self.config;
+        let first_moment_correction = 1.0 - beta1.powi(self.step as i32);
+        let second_moment_correction = 1.0 - beta2.powi(self.step as i32);
+
+        for variable in &self.variables {
+            let parameter = &variable.parameter;
+            let Some(raw_gradient) = gradients.get(parameter) else {
+                continue;
+            };
+            // `torch.optim.Adam`: g <- g + weight_decay * theta. The coupled
+            // gradient then feeds both moments, unlike AdamW's independent
+            // parameter shrinkage.
+            let gradient = if weight_decay == 0.0 {
+                raw_gradient.clone()
+            } else {
+                (raw_gradient + (parameter.as_tensor() * weight_decay)?)?
+            };
+            let next_first_moment =
+                ((variable.first_moment.as_tensor() * beta1)? + (&gradient * (1.0 - beta1))?)?;
+            let next_second_moment = ((variable.second_moment.as_tensor() * beta2)?
+                + (gradient.sqr()? * (1.0 - beta2))?)?;
+
+            // This is algebraically identical to PyTorch's non-capturable,
+            // non-AMSGrad Adam path:
+            // lr / (1-beta1^t) * m / (sqrt(v)/sqrt(1-beta2^t) + eps).
+            let denominator =
+                ((next_second_moment.sqrt()? / second_moment_correction.sqrt())? + epsilon)?;
+            let step_size = learning_rate / first_moment_correction;
+            let next_parameter =
+                (parameter.as_tensor() - ((&next_first_moment / denominator)? * step_size)?)?;
+
+            variable.first_moment.set(&next_first_moment)?;
+            variable.second_moment.set(&next_second_moment)?;
+            parameter.set(&next_parameter)?;
+        }
+        Ok(())
+    }
+
+    fn learning_rate(&self) -> f64 {
+        self.config.learning_rate
+    }
+
+    fn set_learning_rate(&mut self, learning_rate: f64) {
+        self.config.learning_rate = learning_rate;
+    }
+}
 
 /// Requested offline compute backend.
 ///
@@ -228,7 +337,7 @@ impl Default for A2TrainerConfig {
             batch_size: A2_DEFAULT_BATCH_SIZE,
             output_samples: A2_DEFAULT_OUTPUT_SAMPLES,
             learning_rate: A2_INITIAL_LEARNING_RATE,
-            weight_decay: A2_ADAMW_WEIGHT_DECAY,
+            weight_decay: A2_ADAM_WEIGHT_DECAY,
             learning_rate_gamma: A2_LEARNING_RATE_GAMMA,
             threshold_esr: None,
             seed: 0,
@@ -1011,13 +1120,13 @@ pub fn train_a2(
     let mut rng = XorShift64::new(config.seed);
     let mut var_map = VarMap::new();
     let network = A2TrainNetwork::new(&mut var_map, device, &mut rng)?;
-    let mut optimizer = AdamW::new(
+    let mut optimizer = CoupledAdam::new(
         var_map.all_vars(),
-        ParamsAdamW {
-            lr: config.learning_rate,
+        CoupledAdamConfig {
+            learning_rate: config.learning_rate,
             beta1: 0.9,
             beta2: 0.999,
-            eps: 1e-8,
+            epsilon: 1e-8,
             weight_decay: config.weight_decay,
         },
     )?;
@@ -1256,6 +1365,69 @@ mod tests {
     }
 
     #[test]
+    fn coupled_adam_matches_pytorch_weight_decay_semantics() {
+        fn reference_step(
+            parameter: &mut f64,
+            first_moment: &mut f64,
+            second_moment: &mut f64,
+            raw_gradient: f64,
+            step: i32,
+            config: CoupledAdamConfig,
+        ) {
+            let gradient = raw_gradient + config.weight_decay * *parameter;
+            *first_moment = config.beta1 * *first_moment + (1.0 - config.beta1) * gradient;
+            *second_moment =
+                config.beta2 * *second_moment + (1.0 - config.beta2) * gradient * gradient;
+            let step_size = config.learning_rate / (1.0 - config.beta1.powi(step));
+            let denominator =
+                (*second_moment).sqrt() / (1.0 - config.beta2.powi(step)).sqrt() + config.epsilon;
+            *parameter -= step_size * *first_moment / denominator;
+        }
+
+        let device = Device::Cpu;
+        let parameter = Var::new(2.0_f32, &device).unwrap();
+        let config = CoupledAdamConfig {
+            learning_rate: 0.01,
+            beta1: 0.9,
+            beta2: 0.999,
+            epsilon: 1e-8,
+            // Deliberately large so this test clearly distinguishes coupled
+            // Adam from decoupled AdamW.
+            weight_decay: 0.1,
+        };
+        let mut optimizer = CoupledAdam::new(vec![parameter.clone()], config).unwrap();
+        let mut expected_parameter = 2.0_f64;
+        let mut expected_first_moment = 0.0_f64;
+        let mut expected_second_moment = 0.0_f64;
+
+        for (step, raw_gradient) in [(1, 3.0_f64), (2, -1.0_f64)] {
+            let loss = (parameter.as_tensor() * raw_gradient).unwrap();
+            optimizer.backward_step(&loss).unwrap();
+            reference_step(
+                &mut expected_parameter,
+                &mut expected_first_moment,
+                &mut expected_second_moment,
+                raw_gradient,
+                step,
+                config,
+            );
+        }
+
+        let actual_parameter = parameter.to_scalar::<f32>().unwrap() as f64;
+        let actual_first_moment = optimizer.variables[0]
+            .first_moment
+            .to_scalar::<f32>()
+            .unwrap() as f64;
+        let actual_second_moment = optimizer.variables[0]
+            .second_moment
+            .to_scalar::<f32>()
+            .unwrap() as f64;
+        assert!((actual_parameter - expected_parameter).abs() < 2.0e-6);
+        assert!((actual_first_moment - expected_first_moment).abs() < 2.0e-6);
+        assert!((actual_second_moment - expected_second_moment).abs() < 2.0e-6);
+    }
+
+    #[test]
     fn synthetic_batch_runs_forward_backward_and_exports_runtime_weights() {
         let device = Device::Cpu;
         let mut var_map = VarMap::new();
@@ -1282,12 +1454,14 @@ mod tests {
             .unwrap();
         assert!(loss.to_scalar::<f32>().unwrap().is_finite());
 
-        let mut optimizer = AdamW::new(
+        let mut optimizer = CoupledAdam::new(
             var_map.all_vars(),
-            ParamsAdamW {
-                lr: A2_INITIAL_LEARNING_RATE,
-                weight_decay: A2_ADAMW_WEIGHT_DECAY,
-                ..ParamsAdamW::default()
+            CoupledAdamConfig {
+                learning_rate: A2_INITIAL_LEARNING_RATE,
+                beta1: 0.9,
+                beta2: 0.999,
+                epsilon: 1e-8,
+                weight_decay: A2_ADAM_WEIGHT_DECAY,
             },
         )
         .unwrap();
@@ -1480,12 +1654,14 @@ mod tests {
                 .unwrap();
             assert!(loss.to_scalar::<f32>().unwrap().is_finite());
 
-            let mut optimizer = AdamW::new(
+            let mut optimizer = CoupledAdam::new(
                 var_map.all_vars(),
-                ParamsAdamW {
-                    lr: A2_INITIAL_LEARNING_RATE,
-                    weight_decay: A2_ADAMW_WEIGHT_DECAY,
-                    ..ParamsAdamW::default()
+                CoupledAdamConfig {
+                    learning_rate: A2_INITIAL_LEARNING_RATE,
+                    beta1: 0.9,
+                    beta2: 0.999,
+                    epsilon: 1e-8,
+                    weight_decay: A2_ADAM_WEIGHT_DECAY,
                 },
             )
             .unwrap();

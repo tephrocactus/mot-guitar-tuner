@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use egui::{Align, Color32, Layout, RichText, Vec2};
 use mot_core::capture::CaptureTarget;
+use mot_core::capture_asset::{DAW_REFERENCE_ASSET_FILENAME, daw_reference_asset_path};
 use mot_core::model_library::{ModelLibrary, TrainerCapturePreset};
 use mot_ui::{
     ACCENT, BACKGROUND, DIM, ERROR, SUCCESS, TEXT, WAITING, accent_button, background_frame,
@@ -31,6 +32,7 @@ struct EditorState {
     models: Vec<RetrainModel>,
     selected_model_id: Option<String>,
     model_message: Option<String>,
+    reference_message: Option<String>,
     last_saved_model_id: Option<String>,
 }
 
@@ -57,12 +59,14 @@ impl EditorUi<MotTrainerParams> for MotTrainerUi {
             });
 
             let content_height = ui.available_height();
+            let workspace_width =
+                (ui.available_width() - MODEL_BROWSER_WIDTH - COLUMN_GAP).max(0.0);
             ui.horizontal_top(|ui| {
                 ui.spacing_mut().item_spacing.x = COLUMN_GAP;
                 fixed_vertical_panel(ui, Vec2::new(MODEL_BROWSER_WIDTH, content_height), |ui| {
                     model_browser(ui, context, &mut state)
                 });
-                fixed_vertical_panel(ui, Vec2::new(ui.available_width(), content_height), |ui| {
+                fixed_vertical_panel(ui, Vec2::new(workspace_width, content_height), |ui| {
                     main_workspace(ui, context, &mut state)
                 });
             });
@@ -274,6 +278,41 @@ fn open_models_folder() -> Result<(), String> {
     }
 }
 
+fn show_reference_wav_in_finder() -> Result<(), String> {
+    let path = daw_reference_asset_path()?;
+    if path.is_file() {
+        let status = Command::new("/usr/bin/open")
+            .arg("-R")
+            .arg(&path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_err(|error| format!("Could not reveal the reference WAV: {error}"))?;
+        if status.success() {
+            return Ok(());
+        }
+    }
+
+    let folder = path
+        .parent()
+        .ok_or_else(|| "Could not locate the reference WAV folder".to_owned())?;
+    let status = Command::new("/usr/bin/open")
+        .arg(folder)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|error| format!("Could not open the reference WAV folder: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Could not reveal the reference WAV or open its folder: {status}"
+        ))
+    }
+}
+
 fn main_workspace(
     ui: &mut egui::Ui,
     context: &PluginContext<MotTrainerParams>,
@@ -318,7 +357,7 @@ fn model_configuration(
             .num_columns(2)
             .spacing([22.0, mot_ui::ROW_GAP])
             .show(ui, |ui| {
-                ui.label(field_label("MODEL"));
+                ui.label(field_label("NAME"));
                 let mut edited = read_lock_string(&context.model_name);
                 if ui
                     .add_enabled(
@@ -332,6 +371,25 @@ fn model_configuration(
                     write_lock_string(&context.model_name, &edited);
                     state.selected_model_id = None;
                 }
+                ui.end_row();
+
+                ui.label(field_label("REFERENCE WAV"));
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(DAW_REFERENCE_ASSET_FILENAME)
+                            .monospace()
+                            .color(DIM),
+                    );
+                    let response = ui.add(egui::Link::new(
+                        RichText::new("SHOW IN FINDER").small().color(ACCENT),
+                    ));
+                    if response
+                        .on_hover_text("Reveal the canonical 48 kHz mono reference WAV in Finder")
+                        .clicked()
+                    {
+                        state.reference_message = show_reference_wav_in_finder().err();
+                    }
+                });
                 ui.end_row();
 
                 ui.label(field_label("MAX PASSES"));
@@ -350,6 +408,10 @@ fn model_configuration(
                 }
                 ui.end_row();
             });
+
+        if let Some(message) = &state.reference_message {
+            ui.label(RichText::new(message).small().color(WAITING));
+        }
 
         if let Some(selected) = state.selected_model_id.as_deref() {
             ui.label(
@@ -421,7 +483,9 @@ fn status_panel(ui: &mut egui::Ui, context: &PluginContext<MotTrainerParams>) {
 fn status_guidance(status: TrainerStatus) -> &'static str {
     match status {
         TrainerStatus::Loading => "Preparing the capture recorder.",
-        TrainerStatus::Ready => "Arm, then start the DAW transport when Generator is ready.",
+        TrainerStatus::Ready => {
+            "Render the reference through the target chain, then arm Trainer on the aligned render."
+        }
         TrainerStatus::Armed | TrainerStatus::Waiting => {
             "Waiting for Play. Stop and restart transport if it was already running."
         }

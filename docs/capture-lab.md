@@ -1,21 +1,19 @@
-# MOT Generator + MOT Trainer capture lab
+# MOT Trainer capture lab
 
-Capture now uses two different VST3 plug-ins rather than two roles inside one
-large plug-in:
+MOT TRAINER learns from a pair of mono 48 kHz signals:
 
 ```text
-MOT GENERATOR → reference chain or hardware → MOT TRAINER
+canonical excitation → reference chain → DAW-aligned target render
 ```
 
-Both instances independently load the same verified excitation and observe
-the DAW transport. Keep both tracks active/monitored, arm both while transport
-is stopped, wait until both report that they are waiting for transport, then
-press Play or Record once. The same stopped-to-playing edge is their shared
-clock; there is no cross-bundle static, IPC, or hidden audio transfer.
+The DAW owns playback, plug-in delay compensation, recording, and rendering.
+Trainer records the aligned result from its input, validates the pair, and runs
+offline A2-C3 training. There is no separate Generator plug-in or
+cross-plug-in transport protocol.
 
-## Fixed asset and format
+## Canonical source
 
-The project and both tracks must run mono at 48 kHz. Install:
+Install the immutable NAM excitation here:
 
 ```text
 ~/Library/Application Support/Plut&Mot/MOT Guitar Plugin/Capture Assets/input.wav
@@ -30,59 +28,57 @@ channels mono
 SHA-256  70f8ec7f25686a1bd77f25973de8e51a6721e957e81eec121822e5e53366bc41
 ```
 
-The emitted/recorded window is:
+Trainer verifies this immutable source and generates a second file for use in
+the DAW:
 
 ```text
-1 second silence
-→ 4096-sample deterministic sync header
-→ canonical excitation
-→ 2 seconds tail
-→ shared 0.5-second silent alignment margin
+~/Library/Application Support/Plut&Mot/MOT Guitar Plugin/Capture Assets/reference.wav
 ```
 
-Do not stop, seek, loop, change sample rate, or change routing until capture
-finishes. Either plug-in invalidates its local run when its observed transport
-timeline is discontinuous.
+`reference.wav` contains the exact pre-roll, synchronization header,
+canonical excitation, tail, and alignment margin expected by Trainer. Use
+`SHOW IN FINDER` beside `REFERENCE WAV` to reveal it. VST3 provides no
+portable host-independent command for inserting an audio file on the current
+DAW track, so drag the revealed file into the project.
+
+Do not normalize, fade, trim, time-stretch, transpose, or change the clip gain
+of this file. Keep the DAW project and render at mono/48 kHz.
 
 ## Software capture
 
-Use one mono track when the DAW supports the full serial route:
+1. Drag `reference.wav` to a new mono track at a clearly defined project
+   position.
+2. Leave the source item and track gain at unity.
+3. Insert the amp/profile chain that will become the target.
+4. Disable every stage that should not become part of the learned amp:
+   cabinet and room, gate and pedals, modulation, delay, reverb, post EQ,
+   limiter, normalization, and lookahead mastering processing.
+5. Render or freeze the processed track over the exact source time range with
+   plug-in delay compensation enabled.
+6. Keep the mono 48 kHz render in the project without normalization or fades.
+7. Put MOT TRAINER on the rendered track, place the playhead at the exact
+   start of the rendered item, stop transport, click `ARM`, then click Play.
 
-```text
-MOT GENERATOR
-→ reference amp/profile plug-in
-→ MOT TRAINER
-```
+Using a DAW render is preferable to capturing a live chain inside Trainer. The
+DAW compensates latency explicitly reported by the reference plug-ins and
+places source and target on one project timeline. Trainer therefore applies
+zero timing shift to a software render. Correlation may diagnose a suspicious
+capture, but its peak is not removed: filters and nonlinear plug-ins can have
+legitimate causal group delay that belongs to the tone.
 
-MOT GENERATOR ignores track input. MOT TRAINER records its mono input and
-outputs silence by default to reduce feedback risk. Enable `MONITOR` in the
-Trainer header after arming to audition the Return. Audio passes only during
-the recording window; the control is locked before arming and after capture.
-This does not change the signal recorded for capture or used for training.
-DAW recording itself is optional.
+Input gain inside the reference amp/profile is part of the captured setting.
+There is no independent Generator send trim to synchronize or record.
 
-Disable every stage that should not become part of the learned amp:
-
-- cabinet and room;
-- gate and pedals;
-- modulation, delay, and reverb;
-- post EQ and limiter;
-- normalization/lookahead processing.
-
-MOT GENERATOR emits the immutable excitation at unity. MOT TRAINER loads the
-same verified asset and uses it directly as the training input; there is no
-manual gain value to synchronize between the plug-ins and the input is not
-normalized.
-
-Enter a new name in `MODEL`, or use its compact picker to reuse the name and
-available capture metadata from an existing model. The picker is a retraining
-template: training still creates a new immutable model and does not continue
+Enter a new name in `MODEL`, or select an existing model as a metadata
+template. Retraining still creates a new immutable model and does not continue
 from the old neural weights.
 
 ## Hardware amplifier
 
+Use the same DAW-ready reference on a DAW track:
+
 ```text
-MOT GENERATOR
+DAW source track
 → interface LINE OUT
 → reamp box
 → amplifier input
@@ -90,28 +86,38 @@ MOT GENERATOR
 → correctly rated reactive load
 → load RAW / UNFILTERED LINE OUT
 → interface input
-→ MOT TRAINER
+→ DAW Return track
 ```
+
+Record the Return to its own mono track, align it with the DAW's calibrated
+external-hardware insert or recording-offset facility, then play the aligned
+Return through MOT TRAINER from the reference start. If the interface/driver
+does not report the complete round trip accurately, measure a loopback offset
+rather than treating the strongest correlation peak as pure transport
+latency.
 
 Never connect a speaker output directly to an audio interface. Use a speaker
 cable, match impedance, and ensure the load can dissipate the amplifier's
-power. Keep the Return/input-monitor route out of the Generator hardware
-output to prevent feedback. Before enabling Trainer `MONITOR`, verify that the
-Return cannot feed the amplifier input.
+power. Prevent the monitored Return from feeding the amplifier input.
 
-Hardware captures remain explicitly uncalibrated. Record the interface,
-reamp/load, amp/channel/control positions, impedance, and Return gain in
-Trainer's metadata panel. Set amplifier drive with the interface output and
-reamp box. If the Return clips, reduce the load-box line output or interface
-Return gain rather than changing the amplifier drive and therefore the
-captured tone. Never place an attenuator between Speaker Out and the required
-reactive load unless it is explicitly designed and rated for that use.
+Hardware captures remain explicitly uncalibrated in level. Record the
+interface, reamp/load, amp/channel/control positions, impedance, and Return
+gain in Trainer's metadata panel. Set amplifier drive with the interface
+output and reamp box. If the Return clips, reduce the load-box line output or
+interface Return gain rather than changing the amplifier drive and therefore
+the captured tone.
 
-## Alignment, training, and files
+## Validation, training, and files
 
-Trainer first writes the exact preallocated Return to `raw-return.wav`. It
-finds the sync header by normalized correlation within ±24,000 samples,
-performs fractional-sample refinement, then writes:
+Trainer verifies:
+
+- canonical source identity and format;
+- target sample rate and channel layout;
+- target length and timeline consistency;
+- peak below `−1 dBFS`;
+- finite samples and usable signal energy.
+
+The recorded response and its training artifacts are preserved under:
 
 ```text
 ~/Library/Application Support/Plut&Mot/MOT Guitar Plugin/Capture Records/<id>/
@@ -121,14 +127,15 @@ performs fractional-sample refinement, then writes:
 └── capture.json
 ```
 
-Any Return peak above `−1 dBFS` rejects the run before training. Low sync
-correlation also rejects it. The WAVs are preserved.
+For a DAW-rendered software target, `aligned-return.wav` preserves the
+rendered causal timing; the applied training shift is zero. Capture metadata
+records any measured correlation peak separately from an intentionally
+applied hardware calibration.
 
-The trainer optimizes the causal A2-C3 model for 1–400 full passes (one pass
-over every available training window), retains
-the best validation checkpoint, and publishes only when validation ESR is
-below `0.035`. The exported native Player runtime is then rendered over the
-same held-out region and must reproduce the trainer's ESR before publication:
+Trainer optimizes the causal A2-C3 model for 1–400 full passes, retains the
+best validation checkpoint, and publishes only when validation ESR is below
+`0.035`. The exported native Player runtime is rendered over the same held-out
+region and must reproduce the trainer's ESR before publication:
 
 ```text
 ~/Library/Application Support/Plut&Mot/MOT Guitar Plugin/Models/<id>.motmodel
@@ -139,12 +146,10 @@ PLAYER's audio callback.
 
 ## First-version limitations
 
-- Use exactly one armed Generator in the reachable routing graph. Version 0.4
-  has no cross-bundle Session ID and cannot distinguish a summed second source.
-- There is no cross-bundle automatic level-probe handshake yet. Set a safe
-  Return level before the full run; the hard `−1 dBFS` gate still rejects a
-  clipped capture.
-- A host dropout that leaves the reported transport timeline continuous cannot
-  be identified reliably.
+- VST3 cannot portably add `reference.wav` to a host track or initiate a
+  host render; the user performs the drag, render/record, and aligned playback.
+- DAW PDC compensates only latency declared by plug-ins. It does not and
+  should not erase a processor's causal phase/group-delay response.
+- Hardware round-trip compensation depends on DAW/interface calibration.
 - Capture/model playback are mono/48 kHz only.
 - Physical dBu calibration is deferred.

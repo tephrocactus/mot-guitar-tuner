@@ -1,10 +1,10 @@
-//! Real-time-safe two-instance capture primitives.
+//! Capture programs, transport primitives, and offline alignment policy.
 //!
-//! A [`CaptureEngine`] belongs to one plugin instance. `Source` emits an
-//! immutable, exact capture program while `Return` records the signal arriving
-//! on another track. The optional [`CaptureCoordinator`] only exchanges small
-//! state values through atomics; audio never crosses between instances and no
-//! lock, allocation, or file I/O is needed from the audio callback.
+//! The current user workflow renders `reference.wav` through the target chain
+//! in the DAW, then plays the aligned render into MOT Trainer. The older
+//! two-instance [`CaptureEngine`] and [`CaptureCoordinator`] remain available
+//! as low-level experimental primitives; the shipped Trainer does not use
+//! their Source/Return pairing.
 
 use std::fmt;
 use std::sync::Arc;
@@ -167,7 +167,8 @@ impl fmt::Display for CaptureProgramError {
 
 impl std::error::Error for CaptureProgramError {}
 
-/// Immutable audio shared by the Source and Return instances.
+/// Immutable audio used to build `reference.wav` and the matching Trainer
+/// recording contract.
 ///
 /// Construction and cloning happen outside the audio callback. The exact
 /// emitted program is `sync_header` followed immediately by `excitation`.
@@ -1010,12 +1011,49 @@ pub struct AlignmentResult {
     pub sync_start_in_return: f64,
 }
 
+/// Separates the correlator's peak from the latency that is safe to remove
+/// from a causal training pair.
+///
+/// For a transport-synchronized software chain, a non-zero correlation peak
+/// can be caused by the captured processor's own minimum-phase/group-delay
+/// response. Advancing the Return by that amount makes the target non-causal.
+/// Hardware capture, on the other hand, contains an external round-trip delay
+/// that must be removed before training a zero-latency runtime.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TrainingAlignment {
+    pub measured: AlignmentResult,
+    pub applied_training_shift_samples: f64,
+}
+
+#[must_use]
+pub fn resolve_training_alignment(
+    target: CaptureTarget,
+    measured: AlignmentResult,
+) -> Result<TrainingAlignment, AlignmentError> {
+    let applied_training_shift_samples = match target {
+        CaptureTarget::SoftwarePluginChain => 0.0,
+        CaptureTarget::FullAmpUnfilteredLoad if measured.fractional_latency_samples >= 0.0 => {
+            measured.fractional_latency_samples
+        }
+        CaptureTarget::FullAmpUnfilteredLoad => {
+            return Err(AlignmentError::NegativeHardwareLatency {
+                measured: measured.fractional_latency_samples,
+            });
+        }
+    };
+    Ok(TrainingAlignment {
+        measured,
+        applied_training_shift_samples,
+    })
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum AlignmentError {
     ReturnTooShort,
     SyncHeaderTooShort,
     NoFiniteCandidate,
     CorrelationTooLow { measured: f64, required: f64 },
+    NegativeHardwareLatency { measured: f64 },
 }
 
 impl fmt::Display for AlignmentError {
@@ -1033,6 +1071,10 @@ impl fmt::Display for AlignmentError {
             Self::CorrelationTooLow { measured, required } => write!(
                 formatter,
                 "sync correlation {measured:.3} is below the required {required:.3}"
+            ),
+            Self::NegativeHardwareLatency { measured } => write!(
+                formatter,
+                "hardware round-trip latency cannot be negative, measured {measured:.3} samples"
             ),
         }
     }
@@ -1154,7 +1196,17 @@ pub fn extract_aligned_excitation(
     return_audio: &[f32],
     alignment: AlignmentResult,
 ) -> Result<Vec<f32>, AlignmentError> {
-    let first = program.excitation_start_sample() as f64 + alignment.fractional_latency_samples;
+    extract_excitation_at_latency(program, return_audio, alignment.fractional_latency_samples)
+}
+
+/// Extracts a training target using only the latency explicitly selected by
+/// the capture policy.
+pub fn extract_excitation_at_latency(
+    program: &CaptureProgram,
+    return_audio: &[f32],
+    latency_samples: f64,
+) -> Result<Vec<f32>, AlignmentError> {
+    let first = program.excitation_start_sample() as f64 + latency_samples;
     let last = first + program.excitation().len().saturating_sub(1) as f64;
     if first < 0.0 || last.ceil() as usize >= return_audio.len() {
         return Err(AlignmentError::ReturnTooShort);
@@ -1189,7 +1241,7 @@ pub struct HardwareCaptureMetadata {
     pub input_level_dbu: Option<f32>,
     pub output_level_dbu: Option<f32>,
     pub sample_rate_hz: u32,
-    pub measured_latency_samples: Option<f64>,
+    pub sync_peak_lag_samples: Option<f64>,
     pub return_peak_dbfs: Option<f32>,
     pub return_rms_dbfs: Option<f32>,
     pub excitation_hash: String,
@@ -1213,7 +1265,7 @@ impl HardwareCaptureMetadata {
             input_level_dbu: None,
             output_level_dbu: None,
             sample_rate_hz: CAPTURE_SAMPLE_RATE_HZ,
-            measured_latency_samples: None,
+            sync_peak_lag_samples: None,
             return_peak_dbfs: None,
             return_rms_dbfs: None,
             excitation_hash: String::new(),
@@ -1762,6 +1814,100 @@ mod tests {
             extract_aligned_excitation(&program, capture.return_audio().unwrap(), alignment)
                 .unwrap();
         assert_eq!(aligned.len(), program.excitation().len());
+        let training_alignment =
+            resolve_training_alignment(CaptureTarget::FullAmpUnfilteredLoad, alignment).unwrap();
+        assert_eq!(
+            training_alignment.applied_training_shift_samples,
+            alignment.fractional_latency_samples
+        );
+    }
+
+    #[test]
+    fn software_alignment_preserves_a_causal_filter_response() {
+        let sync = (0..127)
+            .map(|index| {
+                let bit = ((index * 73 + 19) % 127) & 1;
+                if bit == 0 { -0.35 } else { 0.35 }
+            })
+            .collect::<Vec<_>>();
+        let mut excitation = vec![0.0; 512];
+        let impulse_index = 64;
+        excitation[impulse_index] = 0.5;
+        let program = CaptureProgram::new(sync, excitation).unwrap();
+        let source = program.exact_source_stream();
+        let fir = [0.05_f32, 0.15, 0.5, 0.2, 0.1];
+        let mut returned = vec![0.0; source.len()];
+        for (index, output) in returned.iter_mut().enumerate() {
+            for (lag, coefficient) in fir.iter().copied().enumerate() {
+                if let Some(source_index) = index.checked_sub(lag) {
+                    *output += source[source_index] * coefficient;
+                }
+            }
+        }
+
+        let measured = measure_alignment(
+            &program,
+            &returned,
+            AlignmentConfig {
+                maximum_lag_samples: 16,
+                minimum_normalized_correlation: 0.25,
+            },
+        )
+        .unwrap();
+        assert!(measured.fractional_latency_samples > 1.0, "{measured:?}");
+
+        let training_alignment =
+            resolve_training_alignment(CaptureTarget::SoftwarePluginChain, measured).unwrap();
+        assert_eq!(training_alignment.applied_training_shift_samples, 0.0);
+        let target = extract_excitation_at_latency(
+            &program,
+            &returned,
+            training_alignment.applied_training_shift_samples,
+        )
+        .unwrap();
+        assert!(
+            target[8..impulse_index]
+                .iter()
+                .all(|sample| sample.abs() < 1.0e-7)
+        );
+        for (lag, coefficient) in fir.iter().copied().enumerate() {
+            assert!(
+                (target[impulse_index + lag] - 0.5 * coefficient).abs() < 1.0e-7,
+                "lag {lag}, target {}, expected {}",
+                target[impulse_index + lag],
+                0.5 * coefficient
+            );
+        }
+
+        let incorrectly_advanced =
+            extract_aligned_excitation(&program, &returned, measured).unwrap();
+        assert!(
+            incorrectly_advanced[8..impulse_index]
+                .iter()
+                .any(|sample| sample.abs() > 1.0e-4),
+            "the regression fixture must expose pre-response energy"
+        );
+    }
+
+    #[test]
+    fn hardware_alignment_rejects_a_negative_round_trip() {
+        let measured = AlignmentResult {
+            integer_latency_samples: -3,
+            fractional_latency_samples: -2.75,
+            normalized_correlation: 0.9,
+            polarity_inverted: false,
+            sync_start_in_return: PRE_ROLL_SAMPLES as f64 - 2.75,
+        };
+        assert_eq!(
+            resolve_training_alignment(CaptureTarget::FullAmpUnfilteredLoad, measured),
+            Err(AlignmentError::NegativeHardwareLatency { measured: -2.75 })
+        );
+        assert_eq!(
+            resolve_training_alignment(CaptureTarget::SoftwarePluginChain, measured)
+                .unwrap()
+                .applied_training_shift_samples,
+            0.0
+        );
     }
 
     #[test]

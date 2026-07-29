@@ -1,15 +1,15 @@
-//! Transport-synchronized capture shared by the standalone Generator and
-//! Trainer plugins.
+//! Transport-synchronized recording used by MOT Trainer.
 //!
-//! There is deliberately no process-global coordinator here. A Generator and
-//! a Trainer each observe their own copy of the host transport and start on
-//! the same stopped-to-playing edge. They only need identical immutable
-//! [`CaptureProgram`] data; audio and state are never exchanged between plugin
-//! instances.
+//! `reference.wav` contains the exact deterministic stream described by
+//! [`CaptureProgram`]. The DAW renders that file through the target chain and
+//! MOT Trainer records the aligned result from a stopped-to-playing edge.
+//! There is no process-global coordinator, cross-instance audio transfer, or
+//! separate source plug-in.
 //!
-//! All storage is prepared before arming. [`GeneratorEngine::process_block`]
+//! All storage is prepared before arming. [`ReferenceRenderer::process_block`]
 //! and [`TrainerRecorder::process_block`] perform no allocation, locking, I/O,
-//! or ownership-count changes.
+//! or ownership-count changes. `ReferenceRenderer` is retained for
+//! deterministic protocol tests and is not shipped as a plug-in.
 
 use std::fmt;
 use std::sync::Arc;
@@ -22,7 +22,7 @@ use crate::capture::{
 /// Extra Return audio retained after the nominal two-second tail.
 ///
 /// A hardware round trip is causal, so its sync header can only arrive later
-/// than the Generator's header. Keeping the existing half-second alignment
+/// than the reference header. Keeping the existing half-second alignment
 /// search range after the nominal capture window lets the offline correlator
 /// recover that delay without shifting either real-time instance.
 pub const DEFAULT_ALIGNMENT_MARGIN_SAMPLES: usize = DEFAULT_MAX_ALIGNMENT_LAG_SAMPLES;
@@ -198,21 +198,23 @@ impl CaptureClock {
     }
 }
 
-/// Real-time engine for MOT Generator.
+/// Deterministic real-time renderer for the canonical reference stream.
+///
+/// This is a core test/utility type, not a shipped plug-in.
 ///
 /// The complete emitted window is exactly:
 ///
 /// `1 second silence -> sync header -> excitation -> 2 seconds silence
 /// -> alignment-margin silence`.
 #[derive(Debug)]
-pub struct GeneratorEngine {
+pub struct ReferenceRenderer {
     program: Arc<CaptureProgram>,
     alignment_margin_samples: usize,
     generation_samples: usize,
     clock: CaptureClock,
 }
 
-impl GeneratorEngine {
+impl ReferenceRenderer {
     pub fn new(
         program: Arc<CaptureProgram>,
         sample_rate_hz: u32,
@@ -290,7 +292,7 @@ impl GeneratorEngine {
         &self.program
     }
 
-    /// Ignores track input and writes the mono Generator output.
+    /// Writes the mono reference stream.
     #[inline]
     pub fn process_block(&mut self, output: &mut [f32], transport: TransportInfo) {
         output.fill(0.0);
@@ -360,9 +362,9 @@ impl CompletedTrainerRecording {
 
 /// Real-time recorder for MOT Trainer.
 ///
-/// It records its own track input from the same transport edge as the
-/// Generator. No Generator reference, session registry, or cross-instance
-/// audio transfer exists.
+/// It records its own track input from a stopped-to-playing transport edge.
+/// The DAW audio item is the source of truth; no session registry or
+/// cross-instance audio transfer exists.
 #[derive(Debug)]
 pub struct TrainerRecorder {
     program: Arc<CaptureProgram>,
@@ -668,7 +670,7 @@ mod tests {
         block_pattern: &[usize],
         sample_count: usize,
     ) -> Vec<f32> {
-        let mut generator = GeneratorEngine::new(program, CAPTURE_SAMPLE_RATE_HZ).unwrap();
+        let mut generator = ReferenceRenderer::new(program, CAPTURE_SAMPLE_RATE_HZ).unwrap();
         generator.arm(false);
         let mut stopped = [1.0; 13];
         generator.process_block(&mut stopped, transport(false, START_TIMELINE));
@@ -826,7 +828,7 @@ mod tests {
     fn generator_and_trainer_share_the_default_full_window() {
         let program = program();
         let mut generator =
-            GeneratorEngine::new(Arc::clone(&program), CAPTURE_SAMPLE_RATE_HZ).unwrap();
+            ReferenceRenderer::new(Arc::clone(&program), CAPTURE_SAMPLE_RATE_HZ).unwrap();
         let trainer = TrainerRecorder::new(Arc::clone(&program), CAPTURE_SAMPLE_RATE_HZ).unwrap();
 
         assert_eq!(
@@ -863,7 +865,7 @@ mod tests {
     fn generator_can_rearm_after_transport_invalidation() {
         let program = program();
         let mut generator =
-            GeneratorEngine::with_alignment_margin(program, CAPTURE_SAMPLE_RATE_HZ, 32).unwrap();
+            ReferenceRenderer::with_alignment_margin(program, CAPTURE_SAMPLE_RATE_HZ, 32).unwrap();
         generator.arm(false);
         generator.process_block(&mut [0.0; 16], transport(true, START_TIMELINE));
         generator.process_block(&mut [0.0; 16], transport(true, START_TIMELINE + 99));
@@ -882,7 +884,7 @@ mod tests {
 
     #[test]
     fn generator_can_disarm_before_transport_starts() {
-        let mut generator = GeneratorEngine::new(program(), CAPTURE_SAMPLE_RATE_HZ).unwrap();
+        let mut generator = ReferenceRenderer::new(program(), CAPTURE_SAMPLE_RATE_HZ).unwrap();
         generator.arm(false);
         generator.process_block(&mut [0.0; 11], transport(false, START_TIMELINE));
         assert_eq!(generator.state(), SplitCaptureState::WaitingForTransport);
@@ -973,7 +975,7 @@ mod tests {
 
         for (hazard, expected) in cases {
             let mut generator =
-                GeneratorEngine::new(Arc::clone(&program), CAPTURE_SAMPLE_RATE_HZ).unwrap();
+                ReferenceRenderer::new(Arc::clone(&program), CAPTURE_SAMPLE_RATE_HZ).unwrap();
             generator.arm(false);
             generator.process_block(&mut [0.0; 16], transport(true, START_TIMELINE));
             generator.process_block(&mut [0.0; 16], hazard);

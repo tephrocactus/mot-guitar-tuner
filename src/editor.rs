@@ -30,7 +30,7 @@ enum EditorTab {
     #[default]
     Amp,
     Tuner,
-    Capture,
+    Settings,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -162,8 +162,8 @@ impl EditorUi<MotStrobeParams> for MotStrobeUi {
                             amp_tab(ui, context, &mut state, panel, panel_alt, cyan, text_dim);
                         }
                         EditorTab::Tuner => tuner_tab(ui, context, panel, cyan, text_dim),
-                        EditorTab::Capture => {
-                            capture_tab(ui, context, &mut state, panel, panel_alt, cyan, text_dim);
+                        EditorTab::Settings => {
+                            settings_tab(ui, context, &mut state, panel, panel_alt, cyan, text_dim);
                         }
                     }
                 });
@@ -392,7 +392,7 @@ fn header(
                 .color(accent),
         );
         ui.label(
-            RichText::new("0.3.1  •  MONO  •  48 kHz  •  ZERO LATENCY")
+            RichText::new("0.3.2  •  MONO  •  48 kHz  •  ZERO LATENCY")
                 .monospace()
                 .color(text_dim),
         );
@@ -415,7 +415,7 @@ fn tab_bar(ui: &mut egui::Ui, state: &mut EditorState, accent: Color32) {
         for (tab, label) in [
             (EditorTab::Amp, "AMP"),
             (EditorTab::Tuner, "TUNER"),
-            (EditorTab::Capture, "CAPTURE"),
+            (EditorTab::Settings, "SETTINGS"),
         ] {
             let selected = state.tab == tab;
             let response = ui.selectable_label(
@@ -985,7 +985,7 @@ fn tuner_tab(
     string_editor(ui, context, panel, accent, text_dim);
 }
 
-fn capture_tab(
+fn settings_tab(
     ui: &mut egui::Ui,
     context: &PluginContext<MotStrobeParams>,
     state: &mut EditorState,
@@ -1001,108 +1001,129 @@ fn capture_tab(
                 .corner_radius(8.0)
                 .inner_margin(16.0)
                 .show(ui, |ui| {
-                    ui.label(RichText::new("CAPTURE INSTANCE").strong().color(accent));
-                    ui.add_space(8.0);
+                    ui.label(RichText::new("CAPTURE LAB").strong().color(accent));
+                    ui.add_space(10.0);
 
+                    // Capture configuration is an explicit two-column form:
+                    // one parameter per row, never a single flowing toolbar.
                     let role = context.capture_role.value().clamp(0, 2);
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new("ROLE").color(text_dim));
-                        for (value, label) in [(0_i64, "NORMAL"), (1, "SOURCE"), (2, "RETURN")] {
-                            if ui.selectable_label(role == value, label).clicked() {
-                                context.automate(P::CaptureRole, value as f64 / 2.0);
-                                if value == 0 && context.capture_armed.value() {
+                    let target = context.capture_target.value().clamp(0, 1);
+                    let mut session_name = read_lock_string(&context.capture_session_name);
+                    let mut model_name = read_lock_string(&context.capture_model_name);
+                    let mut send_trim = context.capture_send_trim.value();
+                    let mut max_passes = context.max_passes.value().clamp(1, 400);
+                    egui::Grid::new("capture_settings_grid")
+                        .num_columns(2)
+                        .spacing([16.0, 10.0])
+                        .min_col_width(104.0)
+                        .show(ui, |ui| {
+                            ui.label(RichText::new("ROLE").color(text_dim));
+                            ui.horizontal(|ui| {
+                                for (value, label) in
+                                    [(0_i64, "NORMAL"), (1, "SOURCE"), (2, "RETURN")]
+                                {
+                                    if ui.selectable_label(role == value, label).clicked() {
+                                        context.automate(P::CaptureRole, value as f64 / 2.0);
+                                        if value == 0 && context.capture_armed.value() {
+                                            context.automate(P::CaptureArmed, 0.0);
+                                        }
+                                    }
+                                }
+                            });
+                            ui.end_row();
+
+                            ui.label(RichText::new("TARGET").color(text_dim));
+                            ui.horizontal(|ui| {
+                                for (value, label) in
+                                    [(0_i64, "SOFTWARE CHAIN"), (1, "HARDWARE AMP")]
+                                {
+                                    if ui.selectable_label(target == value, label).clicked() {
+                                        context.automate(P::CaptureTarget, value as f64);
+                                    }
+                                }
+                            });
+                            ui.end_row();
+
+                            ui.label(RichText::new("SESSION").color(text_dim));
+                            let response = ui.add(
+                                egui::TextEdit::singleline(&mut session_name)
+                                    .hint_text("e.g. amp-room-a")
+                                    .desired_width(300.0),
+                            );
+                            if response.changed() {
+                                write_lock_string(&context.capture_session_name, &session_name);
+                                context
+                                    .capture_session_id
+                                    .store(session_id_from_name(&session_name));
+                                if context.capture_armed.value() {
                                     context.automate(P::CaptureArmed, 0.0);
                                 }
                             }
-                        }
-                    });
-                    let target = context.capture_target.value().clamp(0, 1);
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new("TARGET").color(text_dim));
-                        for (value, label) in [(0_i64, "SOFTWARE CHAIN"), (1, "HARDWARE AMP")] {
-                            if ui.selectable_label(target == value, label).clicked() {
-                                context.automate(P::CaptureTarget, value as f64);
-                            }
-                        }
-                    });
+                            ui.end_row();
 
-                    ui.add_space(8.0);
-                    let mut session_name = read_lock_string(&context.capture_session_name);
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new("SESSION").color(text_dim));
-                        let response = ui.add(
-                            egui::TextEdit::singleline(&mut session_name)
-                                .hint_text("e.g. amp-room-a")
-                                .desired_width(260.0),
-                        );
-                        if response.changed() {
-                            write_lock_string(&context.capture_session_name, &session_name);
-                            context
-                                .capture_session_id
-                                .store(session_id_from_name(&session_name));
-                            if context.capture_armed.value() {
-                                context.automate(P::CaptureArmed, 0.0);
+                            ui.label(RichText::new("SESSION ID").color(text_dim));
+                            ui.label(
+                                RichText::new(format!(
+                                    "{:016x}",
+                                    context.capture_session_id.load()
+                                ))
+                                .small()
+                                .monospace()
+                                .color(text_dim),
+                            );
+                            ui.end_row();
+
+                            ui.label(RichText::new("MODEL NAME").color(text_dim));
+                            if ui
+                                .add(
+                                    egui::TextEdit::singleline(&mut model_name)
+                                        .hint_text("Captured Amp")
+                                        .desired_width(300.0),
+                                )
+                                .changed()
+                            {
+                                write_lock_string(&context.capture_model_name, &model_name);
                             }
-                        }
-                    });
+                            ui.end_row();
+
+                            ui.label(RichText::new("SEND TRIM").color(text_dim));
+                            if ui
+                                .add_sized(
+                                    [300.0, 20.0],
+                                    egui::Slider::new(&mut send_trim, -40.0..=0.0)
+                                        .suffix(" dB")
+                                        .fixed_decimals(1),
+                                )
+                                .changed()
+                            {
+                                automate_linear(context, P::CaptureSendTrim, send_trim, -40.0, 0.0);
+                            }
+                            ui.end_row();
+
+                            ui.label(RichText::new("MAX PASSES").color(text_dim));
+                            if ui
+                                .add_sized(
+                                    [300.0, 20.0],
+                                    egui::Slider::new(&mut max_passes, 1..=400).integer(),
+                                )
+                                .changed()
+                            {
+                                automate_discrete(context, P::MaxPasses, max_passes, 1, 400);
+                            }
+                            ui.end_row();
+                        });
+
                     if !session_name.trim().is_empty() && context.capture_session_id.load() == 0 {
                         context
                             .capture_session_id
                             .store(session_id_from_name(&session_name));
                     }
-                    ui.label(
-                        RichText::new(format!("ID {:016x}", context.capture_session_id.load()))
-                            .small()
-                            .monospace()
-                            .color(text_dim),
-                    );
-
                     ui.add_space(6.0);
-                    let mut model_name = read_lock_string(&context.capture_model_name);
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new("MODEL NAME").color(text_dim));
-                        if ui
-                            .add(
-                                egui::TextEdit::singleline(&mut model_name)
-                                    .hint_text("Captured Amp")
-                                    .desired_width(260.0),
-                            )
-                            .changed()
-                        {
-                            write_lock_string(&context.capture_model_name, &model_name);
-                        }
-                    });
                     egui::CollapsingHeader::new("CAPTURE METADATA")
                         .default_open(false)
                         .show(ui, |ui| {
                             capture_metadata_editor(ui, context, text_dim);
                         });
-
-                    ui.add_space(12.0);
-                    let mut send_trim = context.capture_send_trim.value();
-                    if ui
-                        .add(
-                            egui::Slider::new(&mut send_trim, -40.0..=0.0)
-                                .text("SEND TRIM")
-                                .suffix(" dB")
-                                .fixed_decimals(1),
-                        )
-                        .changed()
-                    {
-                        automate_linear(context, P::CaptureSendTrim, send_trim, -40.0, 0.0);
-                    }
-
-                    let mut max_passes = context.max_passes.value().clamp(1, 400);
-                    if ui
-                        .add(
-                            egui::Slider::new(&mut max_passes, 1..=400)
-                                .text("MAX PASSES")
-                                .integer(),
-                        )
-                        .changed()
-                    {
-                        automate_discrete(context, P::MaxPasses, max_passes, 1, 400);
-                    }
 
                     ui.add_space(12.0);
                     let check_level_state =

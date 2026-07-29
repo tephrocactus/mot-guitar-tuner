@@ -1,11 +1,11 @@
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use egui::{Color32, RichText, Vec2};
+use egui::{Align, Color32, Layout, RichText, Vec2};
 use truce::prelude::*;
 use truce_egui::EditorUi;
 
-use crate::{MotTrainerParams, P, TrainerStatus, read_lock_string, write_lock_string};
+use crate::{MotTrainerParams, P, TrainerStatus, VERSION, read_lock_string, write_lock_string};
 
 pub const WINDOW_SIZE: (u32, u32) = (900, 760);
 
@@ -33,10 +33,27 @@ impl EditorUi<MotTrainerParams> for MotTrainerUi {
                             .strong(),
                     );
                     ui.label(
-                        RichText::new("0.4.1  •  MONO  •  48 kHz")
+                        RichText::new(format!("{VERSION}  •  MONO  •  48 kHz"))
                             .monospace()
                             .color(dim),
                     );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let monitoring = context.monitor.value();
+                        let label_color = if monitoring {
+                            background
+                        } else {
+                            Color32::from_rgb(228, 235, 238)
+                        };
+                        let button = egui::Button::new(RichText::new("MONITOR").color(label_color))
+                            .fill(if monitoring {
+                                accent
+                            } else {
+                                Color32::from_rgb(42, 48, 52)
+                            });
+                        if ui.add(button).clicked() {
+                            context.automate(P::Monitor, if monitoring { 0.0 } else { 1.0 });
+                        }
+                    });
                 });
                 ui.separator();
                 ui.add_space(12.0);

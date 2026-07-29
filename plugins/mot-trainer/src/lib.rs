@@ -31,6 +31,8 @@ use truce_egui::EguiEditor;
 
 use editor::{MotTrainerUi, WINDOW_SIZE};
 
+pub(crate) const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 const PREPARED_CAPACITY: usize = 2;
 const RETIRED_CAPACITY: usize = 4;
 static NEXT_CAPTURE_ID: AtomicU64 = AtomicU64::new(1);
@@ -304,6 +306,8 @@ impl TrainerControl {
 pub struct MotTrainerParams {
     #[param(name = "Bypass", flags = "automatable | bypass")]
     pub bypass: BoolParam,
+    #[param(name = "Monitor", flags = "automatable")]
+    pub monitor: BoolParam,
     #[param(name = "Target", range = "discrete(0, 1)", default = 0)]
     pub target: IntParam,
     #[param(name = "Max Passes", range = "discrete(1, 400)", default = 400)]
@@ -572,7 +576,7 @@ impl PluginLogic for MotTrainer {
                     state.recorder_active = false;
                 }
             } else {
-                output.fill(0.0);
+                render_monitor_output(input, output, params.monitor.value());
                 if state.recorder_active
                     && let Some(recorder) = &mut state.recorder
                 {
@@ -618,6 +622,15 @@ impl PluginLogic for MotTrainer {
 
     fn editor(params: Arc<MotTrainerParams>) -> Box<dyn Editor> {
         EguiEditor::with_ui(params, WINDOW_SIZE, MotTrainerUi).into_editor()
+    }
+}
+
+#[inline]
+fn render_monitor_output(input: &[f32], output: &mut [f32], monitor: bool) {
+    if monitor {
+        output.copy_from_slice(input);
+    } else {
+        output.fill(0.0);
     }
 }
 
@@ -1158,6 +1171,7 @@ mod tests {
     #[test]
     fn defaults_match_capture_contract() {
         let params = MotTrainerParams::new();
+        assert!(!params.monitor.value());
         assert_eq!(params.target.value_i32(), 0);
         assert_eq!(params.max_epochs.value_i32(), 400);
         assert_eq!(params.control.status(), TrainerStatus::Loading);
@@ -1168,6 +1182,18 @@ mod tests {
                 .all(|info| info.name != "Source Send Trim")
         );
         assert_eq!(params.meter_ids().len(), 3);
+    }
+
+    #[test]
+    fn monitor_is_opt_in_and_preserves_the_return_signal() {
+        let input = [0.25, -0.5, 0.75, -1.0];
+        let mut output = [1.0; 4];
+
+        render_monitor_output(&input, &mut output, false);
+        assert_eq!(output, [0.0; 4]);
+
+        render_monitor_output(&input, &mut output, true);
+        assert_eq!(output, input);
     }
 
     #[test]

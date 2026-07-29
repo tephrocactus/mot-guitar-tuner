@@ -55,7 +55,10 @@ MOT GENERATOR
 ```
 
 MOT GENERATOR ignores track input. MOT TRAINER records its mono input and
-outputs silence to reduce feedback risk. DAW recording itself is optional.
+outputs silence by default to reduce feedback risk. Enable `MONITOR` in the
+Trainer header to pass the Return to its output for auditioning; this does not
+change the signal recorded for capture or used for training. DAW recording
+itself is optional.
 
 Disable every stage that should not become part of the learned amp:
 
@@ -87,7 +90,8 @@ MOT GENERATOR
 Never connect a speaker output directly to an audio interface. Use a speaker
 cable, match impedance, and ensure the load can dissipate the amplifier's
 power. Keep the Return/input-monitor route out of the Generator hardware
-output to prevent feedback.
+output to prevent feedback. Before enabling Trainer `MONITOR`, verify that the
+Return cannot feed the amplifier input.
 
 Hardware captures remain explicitly uncalibrated. Record the interface,
 reamp/load, amp/channel/control positions, impedance, and Return gain in

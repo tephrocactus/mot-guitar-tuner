@@ -47,8 +47,11 @@ impl EditorUi<MotTrainerParams> for MotTrainerUi {
         service_model_catalog(&mut state, context);
 
         mot_ui::apply(ui);
-        ui.painter().rect_filled(ui.max_rect(), 0.0, BACKGROUND);
+        let editor_rect = ui.max_rect();
+        let content_width = (editor_rect.width() - mot_ui::OUTER_MARGIN * 2.0).max(0.0);
+        ui.painter().rect_filled(editor_rect, 0.0, BACKGROUND);
         background_frame().show(ui, |ui| {
+            ui.set_min_width(content_width);
             mot_ui::header(ui, "MOT TRAINER", VERSION, false, |ui| {
                 monitor_button(ui, context);
             });

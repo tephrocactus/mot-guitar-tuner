@@ -159,7 +159,7 @@ fn maximum_tracking_model() -> A2Model {
             let output_channel = coefficient_index % A2_CHANNELS;
             *coefficient = if input_channel == output_channel {
                 0.000_03
-            } else if (input_channel + output_channel + layer_index) % 2 == 0 {
+            } else if (input_channel + output_channel + layer_index).is_multiple_of(2) {
                 0.000_01
             } else {
                 -0.000_01

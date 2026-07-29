@@ -15,8 +15,8 @@ use std::fmt;
 use std::sync::Arc;
 
 use crate::capture::{
-    CAPTURE_SAMPLE_RATE_HZ, CaptureInvalidation, CaptureProgram, DEFAULT_MAX_ALIGNMENT_LAG_SAMPLES,
-    PRE_ROLL_SAMPLES, TransportInfo,
+    AlignmentConfig, CAPTURE_SAMPLE_RATE_HZ, CaptureInvalidation, CaptureProgram,
+    DEFAULT_MAX_ALIGNMENT_LAG_SAMPLES, PRE_ROLL_SAMPLES, TransportInfo,
 };
 
 /// Extra Return audio retained after the nominal two-second tail.
@@ -204,10 +204,13 @@ impl CaptureClock {
 ///
 /// The complete emitted window is exactly:
 ///
-/// `1 second silence -> sync header -> excitation -> 2 seconds silence`.
+/// `1 second silence -> sync header -> excitation -> 2 seconds silence
+/// -> alignment-margin silence`.
 #[derive(Debug)]
 pub struct GeneratorEngine {
     program: Arc<CaptureProgram>,
+    alignment_margin_samples: usize,
+    generation_samples: usize,
     send_gain_linear: f32,
     clock: CaptureClock,
 }
@@ -218,12 +221,32 @@ impl GeneratorEngine {
         sample_rate_hz: u32,
         send_gain_linear: f32,
     ) -> Result<Self, SplitCapturePrepareError> {
+        Self::with_alignment_margin(
+            program,
+            sample_rate_hz,
+            send_gain_linear,
+            DEFAULT_ALIGNMENT_MARGIN_SAMPLES,
+        )
+    }
+
+    pub fn with_alignment_margin(
+        program: Arc<CaptureProgram>,
+        sample_rate_hz: u32,
+        send_gain_linear: f32,
+        alignment_margin_samples: usize,
+    ) -> Result<Self, SplitCapturePrepareError> {
         validate_sample_rate(sample_rate_hz)?;
         if !send_gain_linear.is_finite() {
             return Err(SplitCapturePrepareError::InvalidSendGain);
         }
+        let generation_samples = program
+            .total_capture_samples()
+            .checked_add(alignment_margin_samples)
+            .ok_or(SplitCapturePrepareError::RecordingLengthOverflow)?;
         Ok(Self {
             program,
+            alignment_margin_samples,
+            generation_samples,
             send_gain_linear,
             clock: CaptureClock::default(),
         })
@@ -254,7 +277,7 @@ impl GeneratorEngine {
 
     #[must_use]
     pub fn state(&self) -> SplitCaptureState {
-        state_for_clock(&self.clock, &self.program, 0)
+        state_for_clock(&self.clock, &self.program, self.alignment_margin_samples)
     }
 
     #[must_use]
@@ -263,8 +286,13 @@ impl GeneratorEngine {
     }
 
     #[must_use]
-    pub fn total_samples(&self) -> usize {
-        self.program.total_capture_samples()
+    pub const fn total_samples(&self) -> usize {
+        self.generation_samples
+    }
+
+    #[must_use]
+    pub const fn alignment_margin_samples(&self) -> usize {
+        self.alignment_margin_samples
     }
 
     #[must_use]
@@ -280,7 +308,7 @@ impl GeneratorEngine {
             return;
         }
 
-        let total_samples = self.program.total_capture_samples();
+        let total_samples = self.generation_samples;
         let remaining = total_samples.saturating_sub(self.clock.position);
         let processed = remaining.min(output.len());
         for (offset, output_sample) in output[..processed].iter_mut().enumerate() {
@@ -318,6 +346,16 @@ impl CompletedTrainerRecording {
     #[must_use]
     pub const fn alignment_margin_samples(&self) -> usize {
         self.alignment_margin_samples
+    }
+
+    /// Builds the offline correlator contract from the exact margin that was
+    /// used to allocate and record this take.
+    #[must_use]
+    pub fn alignment_config(&self) -> AlignmentConfig {
+        AlignmentConfig {
+            maximum_lag_samples: self.alignment_margin_samples,
+            ..AlignmentConfig::default()
+        }
     }
 
     #[must_use]
@@ -439,6 +477,20 @@ impl TrainerRecorder {
     #[must_use]
     pub const fn alignment_margin_samples(&self) -> usize {
         self.alignment_margin_samples
+    }
+
+    #[must_use]
+    pub const fn peak_linear(&self) -> f32 {
+        self.peak_linear
+    }
+
+    #[must_use]
+    pub fn rms_linear(&self) -> f32 {
+        if self.clock.position == 0 {
+            0.0
+        } else {
+            (self.sum_squares / self.clock.position as f64).sqrt() as f32
+        }
     }
 
     #[must_use]
@@ -774,6 +826,80 @@ mod tests {
             rendered[rendered.len() - TAIL_SAMPLES..]
                 .iter()
                 .all(|sample| *sample == 0.0)
+        );
+    }
+
+    #[test]
+    fn generator_and_trainer_share_the_default_full_window() {
+        let program = program();
+        let mut generator =
+            GeneratorEngine::new(Arc::clone(&program), CAPTURE_SAMPLE_RATE_HZ, 1.0).unwrap();
+        let trainer = TrainerRecorder::new(Arc::clone(&program), CAPTURE_SAMPLE_RATE_HZ).unwrap();
+
+        assert_eq!(
+            generator.alignment_margin_samples(),
+            DEFAULT_ALIGNMENT_MARGIN_SAMPLES
+        );
+        assert_eq!(
+            generator.alignment_margin_samples(),
+            trainer.alignment_margin_samples()
+        );
+        assert_eq!(generator.total_samples(), trainer.total_samples());
+
+        generator.arm(false);
+        let nominal_samples = program.total_capture_samples();
+        let mut nominal_window = vec![f32::NAN; nominal_samples];
+        generator.process_block(&mut nominal_window, transport(true, START_TIMELINE));
+        assert_eq!(
+            generator.state(),
+            SplitCaptureState::AlignmentMargin {
+                completed_samples: 0
+            }
+        );
+
+        let mut alignment_margin = vec![f32::NAN; DEFAULT_ALIGNMENT_MARGIN_SAMPLES];
+        generator.process_block(
+            &mut alignment_margin,
+            transport(true, START_TIMELINE + nominal_samples as i64),
+        );
+        assert_eq!(generator.state(), SplitCaptureState::Ready);
+        assert!(alignment_margin.iter().all(|sample| *sample == 0.0));
+    }
+
+    #[test]
+    fn generator_can_rearm_after_transport_invalidation() {
+        let program = program();
+        let mut generator =
+            GeneratorEngine::with_alignment_margin(program, CAPTURE_SAMPLE_RATE_HZ, 1.0, 32)
+                .unwrap();
+        generator.arm(false);
+        generator.process_block(&mut [0.0; 16], transport(true, START_TIMELINE));
+        generator.process_block(&mut [0.0; 16], transport(true, START_TIMELINE + 99));
+        assert_eq!(
+            generator.state(),
+            SplitCaptureState::Invalid(CaptureInvalidation::TimelineSeek)
+        );
+
+        generator.arm(false);
+        generator.process_block(&mut [0.0; 11], transport(false, START_TIMELINE));
+        assert_eq!(generator.state(), SplitCaptureState::WaitingForTransport);
+        let mut full_window = vec![f32::NAN; generator.total_samples()];
+        generator.process_block(&mut full_window, transport(true, START_TIMELINE));
+        assert_eq!(generator.state(), SplitCaptureState::Ready);
+    }
+
+    #[test]
+    fn completed_recording_alignment_config_uses_its_actual_margin() {
+        let program = program();
+        let margin = 1_337;
+        let input = vec![0.0; program.total_capture_samples() + margin];
+        let recording = record_trainer(program, &input, &[257, 31, 7], margin);
+        let config = recording.alignment_config();
+
+        assert_eq!(config.maximum_lag_samples, margin);
+        assert_eq!(
+            config.minimum_normalized_correlation,
+            AlignmentConfig::default().minimum_normalized_correlation
         );
     }
 

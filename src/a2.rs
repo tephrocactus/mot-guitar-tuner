@@ -710,8 +710,8 @@ impl A2Processor {
 
             let layer = &self.model.weights.layers[layer_index];
             let mut activation = layer.conv_bias;
-            for channel in 0..A2_CHANNELS {
-                activation[channel] += layer.input_mixin[channel] * input;
+            for (channel, activation_sample) in activation.iter_mut().enumerate() {
+                *activation_sample += layer.input_mixin[channel] * input;
             }
 
             for tap in 0..kernel_size {
@@ -724,8 +724,8 @@ impl A2Processor {
                 let source_offset = history_offset + read_position * A2_CHANNELS;
                 for input_channel in 0..A2_CHANNELS {
                     let source = self.state.layer_history[source_offset + input_channel];
-                    for output_channel in 0..A2_CHANNELS {
-                        activation[output_channel] +=
+                    for (output_channel, activation_sample) in activation.iter_mut().enumerate() {
+                        *activation_sample +=
                             layer.conv[conv_index(tap, input_channel, output_channel)] * source;
                     }
                 }
@@ -736,17 +736,16 @@ impl A2Processor {
                     *value *= A2_LEAKY_RELU_SLOPE;
                 }
             }
-            for channel in 0..A2_CHANNELS {
-                head_sum[channel] += activation[channel];
+            for (head_sample, activation_sample) in head_sum.iter_mut().zip(activation) {
+                *head_sample += activation_sample;
             }
 
             let mut next_residual = residual;
-            for output_channel in 0..A2_CHANNELS {
-                next_residual[output_channel] += layer.residual_bias[output_channel];
-                for input_channel in 0..A2_CHANNELS {
-                    next_residual[output_channel] += layer.residual
-                        [matrix_index(input_channel, output_channel)]
-                        * activation[input_channel];
+            for (output_channel, next_sample) in next_residual.iter_mut().enumerate() {
+                *next_sample += layer.residual_bias[output_channel];
+                for (input_channel, activation_sample) in activation.iter().enumerate() {
+                    *next_sample += layer.residual[matrix_index(input_channel, output_channel)]
+                        * activation_sample;
                 }
             }
             residual = next_residual;
@@ -890,6 +889,7 @@ mod tests {
 
     /// Intentionally straightforward full-sequence definition, independent of
     /// the runtime ring-buffer implementation.
+    #[allow(clippy::needless_range_loop)]
     fn reference_render(model: &A2Model, input: &[f32]) -> Vec<f32> {
         let sample_count = input.len();
         let mut layer_inputs = vec![vec![[0.0; A2_CHANNELS]; sample_count]; A2_LAYER_COUNT];

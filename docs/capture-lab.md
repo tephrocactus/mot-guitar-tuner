@@ -1,151 +1,78 @@
-# MOT Guitar Plugin capture lab
+# MOT Generator + MOT Trainer capture lab
 
-This document describes the private two-instance capture workflow implemented
-for MOT Guitar Plugin 0.4. Capture is intentionally isolated from the normal
-amp/cab playback path: it may buffer minutes of audio and train on a worker,
-while NORMAL playback continues to report zero samples of plug-in latency.
-
-## Fixed format and storage
-
-Capture is currently fixed to mono, 48 kHz. Do not enable project resampling,
-item stretching, loop playback, normalization, fades, or any DAW effect that
-changes the timing of the test signal.
-
-The canonical NAM excitation must be installed at:
+Capture now uses two different VST3 plug-ins rather than two roles inside one
+large plug-in:
 
 ```text
-~/Library/Application Support/Plut&Mot/MOT Guitar Plugin/
-└── Capture Assets/
-    └── input.wav
+MOT GENERATOR → reference chain or hardware → MOT TRAINER
 ```
 
-The loader requires the official mono 48 kHz, 24-bit, 9,120,000-sample file
-with SHA-256:
+Both instances independently load the same verified excitation and observe
+the DAW transport. Keep both tracks active/monitored, arm both while transport
+is stopped, wait until both report that they are waiting for transport, then
+press Play or Record once. The same stopped-to-playing edge is their shared
+clock; there is no cross-bundle static, IPC, or hidden audio transfer.
+
+## Fixed asset and format
+
+The project and both tracks must run mono at 48 kHz. Install:
 
 ```text
-70f8ec7f25686a1bd77f25973de8e51a6721e957e81eec121822e5e53366bc41
+~/Library/Application Support/Plut&Mot/MOT Guitar Plugin/Capture Assets/input.wav
 ```
 
-Files produced by the lab use these locations:
+Required contract:
 
 ```text
-~/Library/Application Support/Plut&Mot/MOT Guitar Plugin/
-├── Models/
-│   └── <model_id>.motmodel
-├── Model Settings/
-│   └── <model_id>.json
-└── Capture Records/
-    └── <model_id>/
-        ├── raw-return.wav
-        ├── emitted.wav
-        ├── aligned-return.wav
-        └── capture.json
+samples  9,120,000
+rate     48,000 Hz
+channels mono
+SHA-256  70f8ec7f25686a1bd77f25973de8e51a6721e957e81eec121822e5e53366bc41
 ```
 
-`.motmodel` files are immutable. Publication uses create-new semantics and
-never overwrites an existing model. Editable INPUT GAIN, TIGHT, BITE, and IR
-choices live separately under `Model Settings`.
-
-## Two-instance session
-
-Create two mono tracks and insert one MOT Guitar Plugin instance on each:
-
-- `CAPTURE SOURCE` emits the test stream.
-- `CAPTURE RETURN` records its own track input into a preallocated internal
-  buffer and outputs silence.
-
-Enter exactly the same session name in both instances. The name is converted
-to a shared session ID inside the DAW process. A session permits one Source and
-one Return; up to 16 concurrent session IDs are reserved by the current lab
-build. The tracks need not be adjacent and may use completely different
-hardware or software routing.
-
-The default `AUTO` session is convenient when the project contains only one
-Source/Return pair. Give every pair an explicit unique name when more than one
-pair exists.
-
-At present, press `ARM` on the **Source** instance. The Source atomically arms
-both roles once the Return is present and that pair has passed a fresh
-`CHECK LEVEL`. The level check is mandatory for both software and hardware
-captures: start it on the Return, keep Source active through the final route,
-and wait for `PASS`. If the DAW was already playing when armed, stop it first.
-The capture begins on the next stopped-to-playing transport edge. DAW
-recording is optional.
-
-Do not seek, stop, change sample rate, enable looping, change the pair, or
-change routing before the capture reaches `READY`. Any of those operations
-invalidates the result. One failed side propagates the failure to its peer.
-
-## Exact capture timeline
-
-The internal stream is independent of DAW block size:
+The emitted/recorded window is:
 
 ```text
-1.000 s silence
+1 second silence
 → 4096-sample deterministic sync header
-→ 9,120,000-sample excitation
-→ 2.000 s recorded tail
+→ canonical excitation
+→ 2 seconds tail
+→ shared 0.5-second silent alignment margin
 ```
 
-At 48 kHz the complete Return buffer is 9,268,096 samples, approximately
-193.085 seconds. Source and Return process arbitrary host blocks directly; no
-internal audio quantum is accumulated.
-
-`SEND TRIM` is applied once to the Source output. The exact value is shared
-with the Return through the session coordinator, saved in capture metadata,
-and applied to the trainer input. Training input is not normalized.
-
-The worker locates the sync header by normalized correlation within ±24,000
-samples, refines the result to a fractional sample, and extracts an aligned
-Return excitation. Correlation below 0.35 rejects the capture. Before
-correlation or training starts, the exact complete preallocated Return is
-written to `raw-return.wav`. The exact trimmed Source training input and
-aligned target are retained as `emitted.wav` and `aligned-return.wav`.
-
-The trainer fits the official causal NAM WaveNet A2-C3 architecture. It has
-1,870 trainable parameters; the exported payload contains 1,871 floats,
-including its fixed scale value. Its 6,347-sample receptive field is entirely
-historical/current context, so playback requires zero lookahead and adds zero
-runtime latency.
-
-The `MAX EPOCHS` control accepts 1–400 full epochs and defaults to 400. Each
-epoch traverses the complete training region. A contiguous held-out region
-supplies validation ESR and checkpoint selection, and the best validation
-checkpoint is retained. Publication has a hard quality gate: validation ESR
-must be below `0.30`; an ESR of `0.30` or higher fails training and no model is
-published. Training currently optimizes time-domain MSE. MRSTFT loss or scoring
-is not implemented.
+Do not stop, seek, loop, change sample rate, or change routing until capture
+finishes. Either plug-in invalidates its local run when its observed transport
+timeline is discontinuous.
 
 ## Software capture
 
-A typical software setup is:
+Use one mono track when the DAW supports the full serial route:
 
 ```text
-MOT CAPTURE SOURCE
+MOT GENERATOR
 → reference amp/profile plug-in
-→ bus/send
-→ MOT CAPTURE RETURN
+→ MOT TRAINER
 ```
 
-Use only the chain intended to become the amp model. For an amp-only capture,
-disable cabinet, room, gate, pedals, modulation, delay, reverb, post EQ,
-limiter, normalization, and look-ahead processing. Keep every third-party
-setting and version fixed and record those details in the Capture form.
-`SEND TRIM` defaults to `0.0 dB` (unity) for software capture. Reduce it only
-when the routed chain needs additional headroom, then repeat `CHECK LEVEL`.
+MOT GENERATOR ignores track input. MOT TRAINER records its mono input and
+outputs silence to reduce feedback risk. DAW recording itself is optional.
 
-The Return plug-in should be the first processor that receives the routed
-result. Its output is deliberately silent to reduce feedback risk.
-Run `CHECK LEVEL` on Return through this complete software route and require
-`PASS` before pressing `ARM` on Source.
+Disable every stage that should not become part of the learned amp:
 
-## Real amplifier capture
+- cabinet and room;
+- gate and pedals;
+- modulation, delay, and reverb;
+- post EQ and limiter;
+- normalization/lookahead processing.
 
-The supported first target is a complete amplifier into an unfiltered reactive
-load, with the cabinet added later by MOT's IR loader:
+`SEND TRIM` defaults to `0.0 dB`. Enter the exact same value into Trainer's
+`SOURCE SEND TRIM`; the value is part of the training input and is not
+normalized away.
+
+## Hardware amplifier
 
 ```text
-MOT CAPTURE SOURCE
+MOT GENERATOR
 → interface LINE OUT
 → reamp box
 → amplifier input
@@ -153,74 +80,58 @@ MOT CAPTURE SOURCE
 → correctly rated reactive load
 → load RAW / UNFILTERED LINE OUT
 → interface input
-→ MOT CAPTURE RETURN
+→ MOT TRAINER
 ```
 
-Never connect an amplifier speaker output directly to an audio interface.
-Use a speaker cable between the amplifier and load, match the load impedance,
-and verify that the load can dissipate the amplifier's output power. Keep the
-Return track out of the Source hardware output to prevent a feedback loop.
+Never connect a speaker output directly to an audio interface. Use a speaker
+cable, match impedance, and ensure the load can dissipate the amplifier's
+power. Keep the Return/input-monitor route out of the Generator hardware
+output to prevent feedback.
 
-Current captures are deliberately marked `uncalibrated`:
+Hardware captures remain explicitly uncalibrated. Record the interface,
+reamp/load, amp/channel/control positions, impedance, and Return gain in
+Trainer's metadata panel.
+
+## Alignment, training, and files
+
+Trainer first writes the exact preallocated Return to `raw-return.wav`. It
+finds the sync header by normalized correlation within ±24,000 samples,
+performs fractional-sample refinement, then writes:
 
 ```text
-calibration.status = uncalibrated
-input_level_dbu = null
-output_level_dbu = null
+~/Library/Application Support/Plut&Mot/MOT Guitar Plugin/Capture Records/<id>/
+├── raw-return.wav
+├── emitted.wav
+├── aligned-return.wav
+└── capture.json
 ```
 
-The exact Source send trim is still preserved. INPUT GAIN is adjusted by ear
-after training until physical dBu calibration is implemented.
+Any Return peak above `−1 dBFS` rejects the run before training. Low sync
+correlation also rejects it. The WAVs are preserved.
 
-Before a hardware run, perform a Return level check with the final interface
-gain and amplifier settings. The capture threshold is strict: any Return sample
-above -1 dBFS invalidates the run.
+The trainer optimizes the causal A2-C3 model for 1–400 full passes (one pass
+over every available training window), retains
+the best validation checkpoint, and publishes only when validation ESR is
+below `0.035`. The exported native Player runtime is then rendered over the
+same held-out region and must reproduce the trainer's ESR before publication:
 
-Press `CHECK LEVEL` on the Return instance. While the session reports
-`MEASURING`, Source automatically loops a precomputed one-second,
-maximum-energy fragment of the excitation through the current SEND TRIM and
-the real software/hardware route. Return measures exactly 48,000 incoming
-samples without entering capture and shows `MEASURING`, `PASS`, or `FAIL` plus
-the measured peak. The check rejects a peak above -1 dBFS and any NaN/infinite
-input. `ARM` on Source remains locked until the Return in that same session has
-published `PASS`. Starting another check, changing either member of the pair,
-or changing Source SEND TRIM immediately clears the previous pass. Keep Source
-active and unmuted during the check.
+```text
+~/Library/Application Support/Plut&Mot/MOT Guitar Plugin/Models/<id>.motmodel
+```
 
-## Current implementation limits
+Trainer work is offline and may take many minutes. It does not run in MOT
+PLAYER's audio callback.
 
-The capture lab is functional infrastructure, not yet a public one-button
-profiler. These gaps are intentional and should not be hidden:
+## First-version limitations
 
-- Host stop, timeline jumps, loop mode, sample-rate changes, non-finite level
-  checks, pair loss, and clipping are detected. A dedicated host dropout/xrun
-  notification is not currently available to this VST3 integration, so a
-  dropout that does not also disturb the reported timeline may escape
-  detection. Saving `raw-return.wav` makes later diagnosis possible but does
-  not remove or relax this limitation.
-- Only the Source instance initiates pair arming in the present UI/runtime.
-  `ARM` on Return alone does not start a session.
-- Pairing is process-local. Source and Return can be on different tracks in one
-  DAW, but not in different applications or sandboxed plug-in processes.
-- Capture is fixed to 48 kHz. There is no 44.1/96 kHz capture or training
-  conversion.
-- Physical dBu calibration is not implemented.
-- Changing the Return role/session while its trainer still owns the completed
-  buffer is not a supported workflow. Wait for `MODEL SAVED` (or cancellation
-  completion) before reconfiguring the pair.
-
-## Acceptance checks before relying on a capture
-
-1. Confirm both instances show the same non-zero session ID and complementary
-   Source/Return roles.
-2. Confirm 48 kHz, loop off, and transport stopped before arming.
-3. Run `CHECK LEVEL` on Return with the final routing and require `PASS`.
-4. Let the complete pre-roll, sync, excitation, and tail finish without
-   touching transport or routing.
-5. Require successful sync correlation and alignment.
-6. Confirm `raw-return.wav`, `emitted.wav`, `aligned-return.wav`, and
-   `capture.json` exist.
-7. Confirm the `.motmodel` appeared under the fixed `Models` path and validates
-   as causal, 48 kHz, zero lookahead, and zero runtime latency.
-8. Reload the model in NORMAL mode and compare it at matched loudness against
-   the captured target before deleting any source recording.
+- Generator and Trainer cannot prove each other's manually entered Send Trim;
+  match the displayed values exactly and do not automate either value.
+- Use exactly one armed Generator in the reachable routing graph. Version 0.4
+  has no cross-bundle Session ID and cannot distinguish a summed second source.
+- There is no cross-bundle automatic level-probe handshake yet. Set a safe
+  Return level before the full run; the hard `−1 dBFS` gate still rejects a
+  clipped capture.
+- A host dropout that leaves the reported transport timeline continuous cannot
+  be identified reliably.
+- Capture/model playback are mono/48 kHz only.
+- Physical dBu calibration is deferred.

@@ -5,16 +5,37 @@ url = "https://plutandmot.local"
 au_manufacturer = "PMot"
 
 [[plugin]]
-name = "MOT Guitar Plugin"
-bundle_id = "mot-strobe"
-crate = "mot-strobe"
-category = "effect"
-fourcc = "MStr"
+name = "MOT GENERATOR"
+bundle_id = "mot-generator"
+crate = "mot-generator"
+category = "tool"
+fourcc = "MGen"
 au_tag = "Effects"
-# VST3 secondary subcategory — drives the Cubase plugin submenu.
-# Tighten to your effect kind: "Delay", "Distortion", "Dynamics",
-# "EQ", "Filter", "Mastering", "Modulation", "Pitch Shift",
-# "Reverb", "Surround", "Analyzer", "Spatial". Leave as "Tools" for
-# generic utilities. Without this, Cubase buckets the plugin under
-# "Other".
+vst3_subcategory = "Tools"
+
+[[plugin]]
+name = "MOT TRAINER"
+bundle_id = "mot-trainer"
+crate = "mot-trainer"
+category = "tool"
+fourcc = "MTrn"
+au_tag = "Effects"
+vst3_subcategory = "Tools"
+
+[[plugin]]
+name = "MOT PLAYER"
+bundle_id = "mot-player"
+crate = "mot-player"
+category = "effect"
+fourcc = "MPly"
+au_tag = "Effects"
 vst3_subcategory = "Distortion"
+
+[[plugin]]
+name = "MOT TUNER"
+bundle_id = "mot-tuner"
+crate = "mot-tuner"
+category = "analyzer"
+fourcc = "MTun"
+au_tag = "Effects"
+vst3_subcategory = "Analyzer"

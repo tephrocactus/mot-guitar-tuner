@@ -1,23 +1,44 @@
-# MOT Guitar Plugin
+# MOT Guitar Suite
 
-Private mono guitar amp/cabinet laboratory for macOS ARM64.
+Private Apple-Silicon guitar tools built as four independent mono VST3
+plug-ins in one Rust workspace:
 
-The plug-in combines:
+- **MOT GENERATOR** — emits the immutable NAM excitation WAV on the next
+  DAW Stop → Play edge.
+- **MOT TRAINER** — records the processed Return, aligns it, trains the causal
+  A2 model, applies the validation gate, and publishes an immutable model.
+- **MOT PLAYER** — browses and plays `.motmodel` files, adds the
+  `INPUT GAIN`, `TIGHT`, and `BITE` controls, and loads cabinet IRs.
+- **MOT TUNER** — the standalone chromatic strobe tuner for the Fender Studio
+  input channel.
 
-- a causal neural amp runtime;
-- `INPUT GAIN`, `TIGHT`, and `BITE` controls;
-- a zero-reported-latency cabinet IR loader;
-- the MOT chromatic strobe tuner;
-- a two-instance Source/Return capture lab;
-- a native Rust trainer and immutable `.motmodel` library.
+The wrappers have independent VST3 class IDs, parameter/state schemas, DSP
+states, and single-page editors. Shared format-agnostic DSP and persistence
+live in the root `mot-core` crate.
 
-The live path is fixed to mono, 48 kHz, and reports exactly `0 samples` of
-plug-in latency. There is no lookahead, hidden processing quantum, GPU
-inference, STFT path, or runtime sample-rate conversion.
+## Workspace
 
-## Storage
+```text
+mot-core
+├── causal A2-C3 runtime
+├── model format and library
+├── zero-latency amp/cabinet path
+├── capture program, alignment, and split transport protocol
+├── chromatic tuner
+└── optional Candle/Metal offline trainer
 
-User assets and generated models live outside the VST3 bundle:
+plugins/
+├── mot-generator
+├── mot-trainer
+├── mot-player
+└── mot-tuner
+```
+
+Candle/Metal is enabled only for `mot-trainer`. Player inference remains a
+fixed native CPU implementation with no allocation, lock, I/O, lookahead, or
+hidden internal block in the audio callback.
+
+## Shared storage
 
 ```text
 ~/Library/Application Support/Plut&Mot/MOT Guitar Plugin/
@@ -25,157 +46,81 @@ User assets and generated models live outside the VST3 bundle:
 │   └── input.wav
 ├── Capture Records/
 ├── IRs/
-│   ├── <full-sha256>.wav
-│   └── <full-sha256>.motir.json
 ├── Model Settings/
 └── Models/
 ```
 
-Imported IR WAV files are immutable, content-addressed RAW archives. The WAV
-bytes are never rewritten; the sidecar records the original filename, exact
-SHA-256, format, and the measured default leading-silence trim. Minimum-phase
-conversion is prepared on a worker when the IR is loaded. Project and library
-state retain the exact IR ID and digest, so replacing bytes at the same path
-fails closed instead of silently changing the tone.
-
-The required capture asset is Neural Amp Modeler's canonical mono, 48 kHz,
-24-bit, 9,120,000-sample `input.wav`:
+The required excitation is NAM's canonical mono 48 kHz,
+9,120,000-sample `input.wav`:
 
 ```text
 SHA-256 70f8ec7f25686a1bd77f25973de8e51a6721e957e81eec121822e5e53366bc41
 ```
 
-See [docs/capture-lab.md](docs/capture-lab.md) for software and hardware
-capture routing, level checks, alignment, safety, and trainer behavior.
+Generator and Trainer load and verify this exact asset independently. They do
+not rely on a process-global static or cross-plug-in shared memory. See
+[docs/capture-lab.md](docs/capture-lab.md).
 
-## Zero-latency architecture
+## Zero-latency Player
 
-- Amp model: official NAM WaveNet A2-C3 with 1,870
-  trainable parameters and 1,871 floats in the exported payload.
-- A2-C3 receptive field: 6,347 samples using only current and past input, with
-  zero lookahead and zero runtime latency.
-- Amp controls: causal/minimum-phase filters with per-sample smoothing.
-- Cabinet head: taps `0..63` evaluated directly.
-- Cabinet tail: non-uniform `64 / 256 / 1024` overlap-add stages.
-- IR length: maximum 8192 samples.
-- Default IR import: leading-silence trim and minimum-phase transform.
-- Runtime changes: complete prepared runtimes swapped on a host-block boundary
-  and crossfaded at the same sample positions.
-- Missing or corrupt selected assets: safe-mute amp/cab output; tuner remains
-  available.
-
-RAW IR mode preserves the file's phase and any delay contained in the IR
-itself. That content delay is not reported as plug-in/PDC latency.
+- Mono, native 48 kHz.
+- Official causal NAM WaveNet A2-C3 shape: 1,870 trainable parameters.
+- Receptive field: 6,347 current/past samples; it is history, not latency.
+- VST3-reported latency: exactly `0 samples`.
+- IR maximum: 8192 samples.
+- IR head: direct 64-tap convolution.
+- IR tail: non-uniform partitioned convolution.
+- Default import: auto-trim + minimum phase.
+- RAW mode preserves phase and any delay embedded in the IR itself.
+- Missing/corrupt selected assets fail closed to safe mute.
 
 ## Trainer
 
-Training optimizes the official A2-C3 runtime directly with time-domain MSE.
-The user-selectable maximum is 1–400 full epochs and defaults to 400; every
-epoch traverses the complete training region. A contiguous held-out validation
-region is used for checkpoint selection, and the best validation checkpoint is
-retained.
+Training is real full-dataset optimization, not the removed one-second
+prototype. The control is `MAX PASSES`, 1–400, default 400. One pass is one
+complete traversal of the available training windows. A contiguous
+validation region selects the best checkpoint. A model is published only when
+held-out ESR is below `0.035`; failed captures and their WAVs remain available
+for diagnosis/retraining. Before publication, the exported native Player
+runtime is rendered over the held-out region and its ESR must agree with the
+training graph.
 
-Publication has a hard quality gate: held-out validation ESR must be below
-`0.30`. An ESR of `0.30` or higher fails training and no model is published.
-MRSTFT loss or scoring is not implemented.
+The current loss is time-domain MSE. MRSTFT is not implemented. Training runs
+off the audio callback. `NORMAL` Player inference is CPU-only and unaffected
+by trainer work.
 
-## Build
+## Build and install
 
-Requirements:
-
-- Apple Silicon Mac;
-- current stable Rust;
-- `cargo-truce` 6.3;
-- 48 kHz host session for amp/cab playback and capture.
-
-Release VST3:
+Requirements: Apple Silicon macOS, stable Rust, and `cargo-truce` 6.3.
 
 ```bash
+cargo fmt --all -- --check
+cargo test --workspace --all-features
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo truce build --vst3
 cargo truce install --vst3 --user
 ```
 
-The release profile uses full LTO and one codegen unit.
+Release builds use optimization level 3, full LTO, and one codegen unit.
 
 ## Validation
 
 ```bash
-cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --lib --all-features
-cargo test --lib --features rt-paranoid
-cargo test --release --all-features \
-  acceptance::m3_pro_48k_32_sample_runtime_budget \
-  -- --ignored --nocapture
-cargo test --release --all-features \
-  acceptance::m3_pro_48k_32_sample_30_minute_soak \
-  -- --ignored --nocapture
-cargo test --release --all-features \
-  acceptance::native_48k_aliasing_proxy_release_gate \
-  -- --ignored --nocapture
-/Applications/pluginval.app/Contents/MacOS/pluginval \
-  --validate "$HOME/Library/Audio/Plug-Ins/VST3/MOT Guitar Plugin.vst3" \
-  --strictness-level 5 \
-  --sample-rates 48000 \
-  --block-sizes 1,7,16,32,64,257,512
+cargo test --workspace --all-features
+cargo test --workspace --all-features --features rt-paranoid
+cargo truce validate --pluginval -p mot-generator
+cargo truce validate --pluginval -p mot-trainer
+cargo truce validate --pluginval -p mot-player
+cargo truce validate --pluginval -p mot-tuner
 ```
 
-The machine-local performance gate targets one maximum model + 8192-sample IR
-instance at 48 kHz / 32 samples on a MacBook Pro M3 Pro:
-
-- p99 callback time: at most `0.167 ms`;
-- p99.9 callback time: at most `0.333 ms`;
-- callback deadline: `0.667 ms`.
-
-Timing tests are deliberately ignored in ordinary debug test runs.
-The soak reports wall-clock scheduler outliers separately from the current
-thread's CPU time; neither synthetic measurement is presented as a DAW xrun
-test.
-
-The native-48 kHz alias-risk command is a deterministic release regression
-gate over three fixed stimuli:
-
-- a logarithmic sine sweep measures the nonlinear residual once the
-  instantaneous fundamental exceeds 8 kHz;
-- a 13/17 kHz multitone measures six analytically known folded-product bins
-  relative to the carriers;
-- a synthetic palm-mute DI measures both total nonlinear residual and
-  nonlinear energy above 16 kHz ("Nyquist pressure").
-
-The residual and Nyquist-pressure values are power ratios in dB relative to
-the processed output (`dBr`); the multitone result is relative to its carriers
-(`dBc`). The 0.3.0 ARM64 release baseline is respectively `-21.07 dBr`,
-`-61.94 dBc`, `-6.26 dBr`, and `-66.19 dBr`. The fixed limits include explicit
-regression headroom at `-18 dBr`, `-55 dBc`, `-4 dBr`, and `-58 dBr`.
-They protect the current maximum-cost native-48 kHz runtime against spectral
-regressions. They are deliberately conservative proxies: nonlinear residual
-also contains wanted distortion, a native-rate spectrum cannot identify every
-folded component without a trusted oversampled reference, and the fixed test
-model cannot guarantee the behavior of every future trained model. Passing
-the gate therefore does not replace the listening comparison below.
-
-## Live acceptance
-
-The final host check is deliberately manual:
-
-1. use a native Apple Silicon host at 48 kHz and a 32-sample device buffer;
-2. load one maximum-cost model and an 8192-sample IR;
-3. confirm the host still reports zero samples of plug-in latency;
-4. track or monitor for 30 minutes with no host xrun/dropout indication;
-5. repeat the load test in both Fender Studio and REAPER;
-6. perform a loudness-matched blind comparison against Pasadena at identical
-   32- and 64-sample buffers.
-
-The VST3 integration exposes transport state and sample position but no
-dedicated host xrun/discontinuity flag. Capture therefore rejects stops, seeks,
-loops, sample-rate changes, clipping, pair loss, and discontinuities inferred
-from timeline position; a host dropout that leaves that reported timeline
-continuous cannot be identified reliably by the plug-in alone.
+The core acceptance suite also covers sample-zero onset, arbitrary host block
+sizes, model/IR integrity, bit-exact transparent paths, RT allocation guards,
+capture alignment, and Tuner operation at common sample rates.
 
 ## Scope
 
-Version 0.4 is a private laboratory build. It does not provide physical dBu
-calibration, 44.1/96 kHz model playback, cross-process Capture IPC, stereo
-processing, or a high-latency/HQ mode. Commercial reference plug-ins, presets,
-third-party IRs, rendered captures, and trained model files are local assets
-and are intentionally excluded from Git.
+Version 0.4 is a private laboratory build. Model playback and capture are
+fixed to mono/48 kHz. MOT TUNER alone intentionally supports the host's native
+44.1/48/88.2/96/192 kHz rates. Physical dBu calibration, stereo processing,
+AU wrappers, and a public installer are deferred.

@@ -13,7 +13,8 @@
 //!   432,000 samples;
 //! - output-only joint normalization to -18 dBFS, undone in the exported
 //!   `head_scale`;
-//! - shuffled batches of 16, 8,192 output samples, AdamW at 0.004 with
+//! - shuffled, drop-last batches of 16 × 8,192 output samples, AdamW at
+//!   0.004 with
 //!   weight decay 3.17e-7, and an exponential 0.994 learning-rate schedule;
 //! - best checkpoint selected by validation error-signal ratio (ESR).
 //!
@@ -34,7 +35,8 @@ use candle_nn::{AdamW, Conv1d, Conv1dConfig, Init, Module, Optimizer, ParamsAdam
 
 use crate::a2::{
     A2_CHANNELS, A2_DILATIONS, A2_HEAD_KERNEL_SIZE, A2_HEAD_SCALE, A2_KERNEL_SIZES, A2_LAYER_COUNT,
-    A2_LEAKY_RELU_SLOPE, A2_RECEPTIVE_FIELD_SAMPLES, A2_SAMPLE_RATE_HZ, A2Model, A2Weights,
+    A2_LEAKY_RELU_SLOPE, A2_RECEPTIVE_FIELD_SAMPLES, A2_SAMPLE_RATE_HZ, A2Model, A2Processor,
+    A2Weights,
 };
 
 pub const A2_TRAIN_START_SAMPLE: usize = 480_000;
@@ -334,7 +336,7 @@ pub struct A2DatasetPlan {
     pub validation_start_sample: usize,
     pub validation_stop_sample: usize,
     pub train_window_count: usize,
-    pub full_batches_per_epoch: usize,
+    pub batches_per_epoch: usize,
     pub output_samples_per_window: usize,
     pub input_samples_per_window: usize,
 }
@@ -357,8 +359,8 @@ impl A2DatasetPlan {
         let train_samples = train_stop_sample - A2_TRAIN_START_SAMPLE;
         let single_sample_pairs = train_samples - A2_RECEPTIVE_LOOKBACK;
         let train_window_count = single_sample_pairs / config.output_samples;
-        let full_batches_per_epoch = train_window_count / config.batch_size;
-        if full_batches_per_epoch == 0 {
+        let batches_per_epoch = train_window_count / config.batch_size;
+        if batches_per_epoch == 0 {
             return Err(A2TrainingError::NoCompleteTrainingBatch);
         }
         Ok(Self {
@@ -368,7 +370,7 @@ impl A2DatasetPlan {
             validation_start_sample: train_stop_sample,
             validation_stop_sample: total_samples,
             train_window_count,
-            full_batches_per_epoch,
+            batches_per_epoch,
             output_samples_per_window: config.output_samples,
             input_samples_per_window: A2_RECEPTIVE_LOOKBACK + config.output_samples,
         })
@@ -425,12 +427,12 @@ impl A2PublicationQuality {
         }
     }
 
-    /// The agreed capture-library gate rejects only NAM's explicit failure
-    /// band (`ESR >= 0.30`).  The finer quality label remains available to the
-    /// UI and metadata.
+    /// The private HQ library accepts only NAM's "Great!" and "Not bad!"
+    /// bands. Anything at or above `0.035` remains in Capture Records for
+    /// diagnosis but is not published to the Player model library.
     #[must_use]
     pub const fn passes_publication_gate(self) -> bool {
-        !matches!(self, Self::Failed)
+        matches!(self, Self::Great | Self::NotBad)
     }
 }
 
@@ -460,6 +462,7 @@ pub enum A2TrainingStopReason {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct A2QualityReport {
     pub validation_esr: f64,
+    pub exported_runtime_validation_esr: f64,
     pub validation_esr_db: f64,
     pub quality: A2PublicationQuality,
     pub passes_publication_gate: bool,
@@ -724,6 +727,7 @@ impl A2TrainNetwork {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn make_conv1d(
     var_map: &mut VarMap,
     prefix: &str,
@@ -958,6 +962,33 @@ impl<'a> NormalizedDataset<'a> {
         }
         Ok(Some(error_sum_squares / target_sum_squares))
     }
+
+    fn exported_runtime_validation_esr(&self, model: &A2Model) -> Result<f64, A2TrainingError> {
+        let validation_input =
+            &self.input[self.plan.validation_start_sample..self.plan.validation_stop_sample];
+        let validation_target =
+            &self.target[self.plan.validation_start_sample..self.plan.validation_stop_sample];
+        let mut runtime = A2Processor::new(*model)
+            .map_err(|error| A2TrainingError::InvalidExport(error.to_string()))?;
+        let mut rendered = vec![0.0; validation_input.len()];
+        runtime.process_block(validation_input, &mut rendered);
+
+        let rendered = &rendered[A2_RECEPTIVE_LOOKBACK..];
+        let target = &validation_target[A2_RECEPTIVE_LOOKBACK..];
+        let mut error_sum_squares = 0.0_f64;
+        let mut target_sum_squares = 0.0_f64;
+        for (&prediction, &expected) in rendered.iter().zip(target) {
+            let prediction = f64::from(prediction);
+            let expected = f64::from(expected);
+            let error = prediction - expected;
+            error_sum_squares += error * error;
+            target_sum_squares += expected * expected;
+        }
+        if target_sum_squares <= 0.0 {
+            return Err(A2TrainingError::SilentTrainingTarget);
+        }
+        Ok(error_sum_squares / target_sum_squares)
+    }
 }
 
 /// Train the official fixed A2 C=3 network and return the best validation
@@ -1013,11 +1044,9 @@ pub fn train_a2(
         // sufficient for progress reporting and the non-finite guard.
         let mut epoch_mse_sum: Option<Tensor> = None;
         let mut processed_batches = 0_usize;
+        let mut processed_windows = 0_usize;
 
-        for batch_indices in indices
-            .chunks_exact(config.batch_size)
-            .take(dataset.plan.full_batches_per_epoch)
-        {
+        for batch_indices in indices.chunks_exact(config.batch_size) {
             if cancellation.is_cancelled() {
                 stop_reason = A2TrainingStopReason::Cancelled;
                 break;
@@ -1036,6 +1065,7 @@ pub fn train_a2(
             // spectral loss under the same name.
             optimizer.backward_step(&mse)?;
             processed_batches += 1;
+            processed_windows += batch_indices.len();
         }
 
         if cancellation.is_cancelled() {
@@ -1069,9 +1099,7 @@ pub fn train_a2(
         }
 
         let epoch_seconds = epoch_started.elapsed().as_secs_f64();
-        let processed_output_samples = processed_batches
-            .saturating_mul(config.batch_size)
-            .saturating_mul(config.output_samples);
+        let processed_output_samples = processed_windows.saturating_mul(config.output_samples);
         let epoch_training_mse = epoch_mse_sum / processed_batches.max(1) as f64;
         progress(A2TrainingProgress {
             completed_epochs,
@@ -1102,15 +1130,24 @@ pub fn train_a2(
     let best_snapshot = best_snapshot.ok_or(A2TrainingError::CancelledBeforeFirstCheckpoint)?;
     best_snapshot.restore(&var_map, device)?;
     let model = network.export(dataset.normalization_gain)?;
-    let quality = A2PublicationQuality::from_esr(best_validation_esr);
+    let exported_runtime_validation_esr = dataset.exported_runtime_validation_esr(&model)?;
+    let runtime_esr_tolerance = (best_validation_esr.abs() * 0.005).max(5.0e-5);
+    if (exported_runtime_validation_esr - best_validation_esr).abs() > runtime_esr_tolerance {
+        return Err(A2TrainingError::InvalidExport(format!(
+            "exported runtime ESR {exported_runtime_validation_esr:.9} does not match \
+             training graph ESR {best_validation_esr:.9}"
+        )));
+    }
+    let quality = A2PublicationQuality::from_esr(exported_runtime_validation_esr);
     Ok(A2TrainingOutcome {
         model,
         completed_epochs,
         best_epoch,
         stop_reason,
         quality: A2QualityReport {
-            validation_esr: best_validation_esr,
-            validation_esr_db: 10.0 * best_validation_esr.log10(),
+            validation_esr: exported_runtime_validation_esr,
+            exported_runtime_validation_esr,
+            validation_esr_db: 10.0 * exported_runtime_validation_esr.log10(),
             quality,
             passes_publication_gate: quality.passes_publication_gate(),
             original_train_target_rms_dbfs: dataset.original_train_target_rms_dbfs,
@@ -1315,7 +1352,36 @@ mod tests {
     }
 
     #[test]
-    fn canonical_plan_matches_nam_v3_crop_and_drop_last_batches() {
+    fn exported_runtime_validation_esr_scores_the_native_player_path() {
+        let sample_count = A2_RECEPTIVE_LOOKBACK + 32;
+        let input = vec![0.0; sample_count];
+        let target = vec![0.25; sample_count];
+        let dataset = NormalizedDataset {
+            input: &input,
+            target: &target,
+            plan: A2DatasetPlan {
+                total_samples: sample_count,
+                train_start_sample: 0,
+                train_stop_sample: 0,
+                validation_start_sample: 0,
+                validation_stop_sample: sample_count,
+                train_window_count: 0,
+                batches_per_epoch: 0,
+                output_samples_per_window: 0,
+                input_samples_per_window: 0,
+            },
+            normalization_gain: 1.0,
+            original_train_target_rms_dbfs: -12.041_199_826,
+        };
+
+        let esr = dataset
+            .exported_runtime_validation_esr(&A2Model::zeros())
+            .unwrap();
+        assert!((esr - 1.0).abs() <= f64::EPSILON);
+    }
+
+    #[test]
+    fn canonical_plan_uses_only_complete_drop_last_batches() {
         let total_samples = 9_120_000;
         let config = A2TrainerConfig {
             device: A2TrainingDevice::Cpu,
@@ -1328,11 +1394,15 @@ mod tests {
         assert_eq!(plan.validation_stop_sample, 9_120_000);
         assert_eq!(
             plan.train_window_count,
-            (8_208_000 - A2_RECEPTIVE_LOOKBACK) / 8_192
+            (8_208_000 - A2_RECEPTIVE_LOOKBACK) / A2_DEFAULT_OUTPUT_SAMPLES
         );
         assert_eq!(
-            plan.full_batches_per_epoch,
+            plan.batches_per_epoch,
             plan.train_window_count / A2_DEFAULT_BATCH_SIZE
+        );
+        assert!(
+            plan.train_window_count - plan.batches_per_epoch * A2_DEFAULT_BATCH_SIZE
+                < A2_DEFAULT_BATCH_SIZE
         );
         assert_eq!(
             plan.input_samples_per_window,
@@ -1362,7 +1432,9 @@ mod tests {
             A2PublicationQuality::from_esr(0.4),
             A2PublicationQuality::Failed
         );
-        assert!(A2PublicationQuality::ProbablyPoor.passes_publication_gate());
+        assert!(A2PublicationQuality::NotBad.passes_publication_gate());
+        assert!(!A2PublicationQuality::MightSoundOkay.passes_publication_gate());
+        assert!(!A2PublicationQuality::ProbablyPoor.passes_publication_gate());
         assert!(!A2PublicationQuality::Failed.passes_publication_gate());
     }
 
@@ -1388,7 +1460,7 @@ mod tests {
             target_values: &[f32],
         ) -> (Vec<f32>, Vec<f32>) {
             let mut var_map = VarMap::new();
-            let mut rng = XorShift64::new(0x4d45_5441_4c);
+            let mut rng = XorShift64::new(0x004d_4554_414c);
             let network = A2TrainNetwork::new(&mut var_map, device, &mut rng).unwrap();
             let output_samples = target_values.len();
             let input = Tensor::from_slice(

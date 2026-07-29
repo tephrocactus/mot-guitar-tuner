@@ -1,0 +1,20 @@
+[package]
+name = "mot-tuner"
+version = "0.4.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[features]
+default = ["vst3"]
+vst3 = ["dep:truce-vst3"]
+shell = ["truce/shell"]
+rt-paranoid = ["truce/rt-paranoid", "mot-core/rt-paranoid"]
+
+[dependencies]
+mot-core = { path = "../.." }
+truce = { version = "6.3" }
+truce-egui = { version = "6.3" }
+truce-vst3 = { version = "6.3", optional = true }
+egui = "0.34"

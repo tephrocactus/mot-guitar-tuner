@@ -6,8 +6,9 @@ plug-ins in one Rust workspace:
 - **MOT TRAINER** — records a DAW-aligned render of the canonical excitation,
   trains the causal A2 model, applies the validation gate, and publishes an
   immutable model.
-- **MOT PLAYER** — browses and plays `.motmodel` files, adds the
-  `INPUT GAIN`, `TIGHT`, and `BITE` controls, and loads cabinet IRs.
+- **MOT PLAYER** — browses and plays `.motmodel` files, losslessly imports
+  compatible NAM A2 Nano models, adds the `INPUT GAIN`, `TIGHT`, and `BITE`
+  controls, and loads cabinet IRs.
 - **MOT TUNER** — the standalone chromatic strobe tuner for the Fender Studio
   input channel.
 
@@ -76,6 +77,18 @@ aligned render through Trainer from its exact start. See
 - Default import: auto-trim + minimum phase.
 - RAW mode preserves phase and any delay embedded in the IR itself.
 - Missing/corrupt selected assets fail closed to safe mute.
+
+`IMPORT NAM…` accepts a direct WaveNet A2 Nano/C=3 model or extracts the
+compatible C=3 submodel from a modern NAM `SlimmableContainer`. Import is
+strict: the source must be 48 kHz and match the exact A2 configuration and
+official 1,871-value weight stream. LSTM, Linear, C8-only, and other WaveNet
+shapes are rejected instead of being silently reshaped into a different
+sound; those architectures require a future offline distillation path.
+Extracted container models carry a persistent `C3 Nano` suffix because a NAM
+host may select the container's C8 model by default. Source SHA-256, selected
+submodel, and original NAM metadata (including dBu calibration fields) are
+retained in an immutable adjacent `.nam-import.json` file. The Player does not
+apply physical dBu calibration automatically.
 
 ## Trainer
 

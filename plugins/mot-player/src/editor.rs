@@ -84,9 +84,11 @@ struct EditorState {
     ir_metadata: BTreeMap<PathBuf, IrImportMetadata>,
     baseline: Option<ToneView>,
     pending_model: Option<ModelEntry>,
+    pending_auto_select: Option<ModelEntry>,
     refresh_pending: bool,
     switch_after_save: bool,
     message: Option<String>,
+    message_after_refresh: Option<String>,
 }
 
 pub(crate) struct MotPlayerUi;
@@ -105,6 +107,7 @@ impl EditorUi<MotPlayerParams> for MotPlayerUi {
         poll_library_outcomes(&mut state, context);
         poll_ir_import_outcome(&mut state, context);
         service_pending_library_refresh(&mut state, context);
+        service_pending_auto_selection(&mut state, context);
 
         mot_ui::apply(ui);
         ui.painter()
@@ -165,6 +168,28 @@ fn service_pending_library_refresh(
     }
 }
 
+fn service_pending_auto_selection(
+    state: &mut EditorState,
+    context: &PluginContext<MotPlayerParams>,
+) {
+    if context.library_control.is_busy() {
+        return;
+    }
+    let Some(entry) = state.pending_auto_select.take() else {
+        return;
+    };
+    if tone_is_dirty(state, context) {
+        let display_name = entry.metadata.display_name.clone();
+        state.pending_model = Some(entry);
+        state.message = Some(format!(
+            "“{display_name}” is imported. Save or discard the current model settings to select it."
+        ));
+    } else if let Err(error) = request_select_model(state, context, entry.clone()) {
+        state.pending_auto_select = Some(entry);
+        state.message = Some(error);
+    }
+}
+
 fn submit_library_task(
     context: &PluginContext<MotPlayerParams>,
     operation: LibraryTaskOperation,
@@ -213,6 +238,9 @@ fn poll_library_outcomes(state: &mut EditorState, context: &PluginContext<MotPla
             LibraryOutcome::ToneSaved {
                 settings, result, ..
             } => apply_saved_tone_outcome(state, context, settings, result),
+            LibraryOutcome::NamImported { result, .. } => {
+                apply_nam_import_outcome(state, context, result);
+            }
             LibraryOutcome::FolderOpened { result, .. } => match result {
                 Ok(()) => state.message = None,
                 Err(error) => state.message = Some(error),
@@ -284,7 +312,38 @@ fn apply_library_scan_outcome(
             state.baseline = Some(tone_view_from_settings(&tone, library));
         }
     }
-    state.message = first_error;
+    let message_after_refresh = state.message_after_refresh.take();
+    state.message = first_error.or(message_after_refresh);
+}
+
+fn apply_nam_import_outcome(
+    state: &mut EditorState,
+    context: &PluginContext<MotPlayerParams>,
+    result: Result<Box<mot_core::model_library::ImportedNam>, String>,
+) {
+    let imported = match result {
+        Ok(imported) => imported,
+        Err(error) => {
+            state.message = Some(error);
+            return;
+        }
+    };
+    let display_name = imported.entry.metadata.display_name.clone();
+    let mut message = format!("Imported “{display_name}” from NAM.");
+    if let Some(notice) = imported.notice {
+        message.push(' ');
+        message.push_str(&notice);
+    }
+
+    state.refresh_pending = true;
+    if tone_is_dirty(state, context) {
+        state.pending_model = Some(imported.entry);
+        message.push_str(" Save or discard the current model settings to select it.");
+    } else {
+        state.pending_auto_select = Some(imported.entry);
+    }
+    state.message = Some(message.clone());
+    state.message_after_refresh = Some(message);
 }
 
 fn poll_ir_import_outcome(state: &mut EditorState, context: &PluginContext<MotPlayerParams>) {
@@ -364,7 +423,7 @@ fn model_browser(
         let selected_id = read_shared_string(&context.selected_model_id);
         let selected_hash = read_shared_string(&context.selected_model_sha256);
         let models = state.scan.models.clone();
-        let list_height = (ui.available_height() - 104.0).max(180.0);
+        let list_height = (ui.available_height() - 142.0).max(180.0);
         egui::ScrollArea::vertical()
             .id_salt("mot_player_model_browser")
             .max_height(list_height)
@@ -412,15 +471,33 @@ fn model_browser(
                     if response.clicked() && !selected {
                         if tone_is_dirty(state, context) {
                             state.pending_model = Some(entry);
-                        } else {
-                            request_select_model(state, context, entry);
+                        } else if let Err(error) = request_select_model(state, context, entry) {
+                            state.message = Some(error);
                         }
                     }
                 }
             });
 
+        let busy = context.library_control.is_busy();
+        if ui
+            .add_enabled_ui(!busy, |ui| {
+                ui.add_sized([ui.available_width(), 30.0], ghost_button("IMPORT NAM…"))
+            })
+            .inner
+            .clicked()
+            && let Some(source) = rfd::FileDialog::new()
+                .add_filter("Neural Amp Modeler", &["nam", "NAM"])
+                .pick_file()
+        {
+            match submit_library_task(context, LibraryTaskOperation::ImportNam { source }) {
+                Ok(()) => {
+                    state.message = Some("Validating and converting the NAM model…".to_owned());
+                }
+                Err(error) => state.message = Some(error),
+            }
+        }
+
         ui.columns(2, |columns| {
-            let busy = context.library_control.is_busy();
             if columns[0]
                 .add_enabled_ui(!busy, |ui| {
                     ui.add_sized([ui.available_width(), 30.0], ghost_button("REFRESH"))
@@ -487,8 +564,10 @@ fn model_browser(
                     if ui.add_enabled(!busy, accent_button("SAVE")).clicked() {
                         request_save_current_tone(state, context, true);
                     }
-                    if ui.add_enabled(!busy, danger_button("DISCARD")).clicked() {
-                        request_select_model(state, context, pending.clone());
+                    if ui.add_enabled(!busy, danger_button("DISCARD")).clicked()
+                        && let Err(error) = request_select_model(state, context, pending.clone())
+                    {
+                        state.message = Some(error);
                     }
                     if ui.add_enabled(!busy, ghost_button("CANCEL")).clicked() {
                         state.pending_model = None;
@@ -961,19 +1040,18 @@ fn request_select_model(
     state: &mut EditorState,
     context: &PluginContext<MotPlayerParams>,
     entry: ModelEntry,
-) {
+) -> Result<(), String> {
     let display_name = entry.metadata.display_name.clone();
-    match submit_library_task(
+    submit_library_task(
         context,
         LibraryTaskOperation::LoadTone {
             entry: Box::new(entry),
             guard_model_id: read_shared_string(&context.selected_model_id),
             guard_model_sha256: read_shared_string(&context.selected_model_sha256),
         },
-    ) {
-        Ok(()) => state.message = Some(format!("Loading “{display_name}”…")),
-        Err(error) => state.message = Some(error),
-    }
+    )?;
+    state.message = Some(format!("Loading “{display_name}”…"));
+    Ok(())
 }
 
 fn apply_loaded_model(
@@ -1114,8 +1192,10 @@ fn apply_saved_tone_outcome(
                 None
             };
             state.switch_after_save = false;
-            if let Some(target) = switch_target {
-                request_select_model(state, context, target);
+            if let Some(target) = switch_target
+                && let Err(error) = request_select_model(state, context, target)
+            {
+                state.message = Some(error);
             }
         }
         Err(error) => {

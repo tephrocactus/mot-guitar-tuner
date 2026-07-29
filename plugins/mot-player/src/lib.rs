@@ -16,8 +16,8 @@ use crossbeam_queue::ArrayQueue;
 use mot_core::amp::AmpControls;
 use mot_core::model::{ModelRef, Sha256Digest};
 use mot_core::model_library::{
-    ImportedIr, IrLibraryScan, IrProcessingMode, IrReference, ModelEntry, ModelLibrary, ModelScan,
-    ToneSettings,
+    ImportedIr, ImportedNam, IrLibraryScan, IrProcessingMode, IrReference, ModelEntry,
+    ModelLibrary, ModelScan, ToneSettings,
 };
 use mot_core::runtime::{
     PreparedRuntime, RuntimeAsset, RuntimeLoadRequest, RuntimeLoadStatus, RuntimeLoader,
@@ -233,6 +233,10 @@ pub(crate) enum LibraryOutcome {
         settings: ToneSettings,
         result: Result<(), String>,
     },
+    NamImported {
+        request_id: u64,
+        result: Result<Box<ImportedNam>, String>,
+    },
     FolderOpened {
         request_id: u64,
         result: Result<(), String>,
@@ -245,6 +249,7 @@ impl LibraryOutcome {
             Self::Scanned { request_id, .. }
             | Self::ToneLoaded { request_id, .. }
             | Self::ToneSaved { request_id, .. }
+            | Self::NamImported { request_id, .. }
             | Self::FolderOpened { request_id, .. } => *request_id,
         }
     }
@@ -329,6 +334,9 @@ pub(crate) enum LibraryTaskOperation {
     SaveTone {
         model_reference: ModelRef,
         settings: ToneSettings,
+    },
+    ImportNam {
+        source: PathBuf,
     },
     OpenFolder,
 }
@@ -429,6 +437,13 @@ fn run_library_task(task: LibraryTask) -> LibraryOutcome {
                 result,
             }
         }
+        LibraryTaskOperation::ImportNam { source } => LibraryOutcome::NamImported {
+            request_id,
+            result: library
+                .import_nam(&source)
+                .map(Box::new)
+                .map_err(|error| error.to_string()),
+        },
         LibraryTaskOperation::OpenFolder => LibraryOutcome::FolderOpened {
             request_id,
             result: open_library_folder(&library),
@@ -460,6 +475,10 @@ fn library_unavailable_outcome(
         LibraryTaskOperation::SaveTone { settings, .. } => LibraryOutcome::ToneSaved {
             request_id,
             settings,
+            result: Err(message),
+        },
+        LibraryTaskOperation::ImportNam { .. } => LibraryOutcome::NamImported {
+            request_id,
             result: Err(message),
         },
         LibraryTaskOperation::OpenFolder => LibraryOutcome::FolderOpened {

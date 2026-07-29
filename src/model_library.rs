@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::env;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -18,6 +18,7 @@ use crate::capture::CaptureTarget;
 use crate::model::{
     ModelError, ModelMetadata, ModelRef, ModelRuntimeLimits, MotModel, Sha256Digest, sha256,
 };
+use crate::nam_import::{MAX_NAM_SOURCE_BYTES, convert_nam};
 use crate::wav_io::decode_mono_wav;
 
 pub const TONE_SETTINGS_VERSION: u32 = 1;
@@ -220,6 +221,13 @@ pub struct ImportedIr {
     pub archived_path: PathBuf,
     pub reference: IrReference,
     pub metadata: IrImportMetadata,
+}
+
+#[derive(Clone, Debug)]
+pub struct ImportedNam {
+    pub entry: ModelEntry,
+    pub provenance_path: PathBuf,
+    pub notice: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -530,6 +538,81 @@ impl ModelLibrary {
         Ok(Some(settings))
     }
 
+    /// Converts a compatible NAM A2/C3 model and publishes one immutable,
+    /// content-addressed `.motmodel` in the local model library.
+    ///
+    /// The source `.nam` is only read. Conversion and publication are blocking
+    /// worker operations and must never run in the audio callback or editor
+    /// paint path.
+    pub fn import_nam(&self, source: &Path) -> Result<ImportedNam, LibraryError> {
+        let source_filename = file_name_string(source)?;
+        if !fs::metadata(source)?.is_file() {
+            return Err(LibraryError::InvalidNamImport(
+                "NAM source must be a regular file".to_owned(),
+            ));
+        }
+        let source_file = File::open(source)?;
+        let source_metadata = source_file.metadata()?;
+        if !source_metadata.is_file() {
+            return Err(LibraryError::InvalidNamImport(
+                "NAM source changed and is no longer a regular file".to_owned(),
+            ));
+        }
+        let source_size = source_metadata.len();
+        if source_size > MAX_NAM_SOURCE_BYTES as u64 {
+            return Err(LibraryError::InvalidNamImport(format!(
+                "NAM source is {source_size} bytes; maximum is {MAX_NAM_SOURCE_BYTES}"
+            )));
+        }
+        let mut source_bytes =
+            Vec::with_capacity(usize::try_from(source_size).unwrap_or(MAX_NAM_SOURCE_BYTES));
+        source_file
+            .take(MAX_NAM_SOURCE_BYTES as u64 + 1)
+            .read_to_end(&mut source_bytes)?;
+        if source_bytes.len() > MAX_NAM_SOURCE_BYTES {
+            return Err(LibraryError::InvalidNamImport(format!(
+                "NAM source exceeds the {MAX_NAM_SOURCE_BYTES}-byte maximum"
+            )));
+        }
+        let converted = convert_nam(&source_bytes, &source_filename)
+            .map_err(|error| LibraryError::InvalidNamImport(error.to_string()))?;
+        let model_bytes = converted.model.to_bytes()?;
+        let provenance_bytes = converted
+            .provenance_json()
+            .map_err(|error| LibraryError::InvalidNamImport(error.to_string()))?;
+        let digest = converted.model.content_sha256();
+        let filename_hint = format!("{digest}.motmodel");
+        let path = self.paths.models.join(&filename_hint);
+        let provenance_path = self.paths.models.join(format!("{digest}.nam-import.json"));
+        let mut notice = converted.selection.notice();
+        if converted.has_calibration_metadata() {
+            let calibration_notice =
+                "NAM dBu calibration metadata was retained but is not applied automatically.";
+            notice = Some(match notice {
+                Some(mut existing) => {
+                    existing.push(' ');
+                    existing.push_str(calibration_notice);
+                    existing
+                }
+                None => calibration_notice.to_owned(),
+            });
+        }
+
+        fs::create_dir_all(&self.paths.models)?;
+        let _ = publish_immutable(&provenance_path, &provenance_bytes)?;
+        let _ = publish_immutable(&path, &model_bytes)?;
+        let entry = ModelEntry {
+            path,
+            reference: converted.model.model_ref(filename_hint),
+            metadata: converted.model.metadata().clone(),
+        };
+        Ok(ImportedNam {
+            entry,
+            provenance_path,
+            notice,
+        })
+    }
+
     /// Imports one mono 48 kHz cabinet IR into the immutable local RAW archive.
     ///
     /// Validation and minimum-phase trim analysis happen before any library
@@ -718,6 +801,7 @@ pub enum LibraryError {
     HomeDirectoryUnavailable,
     InvalidToneSettings(String),
     UnsupportedToneSettingsVersion(u32),
+    InvalidNamImport(String),
     InvalidIrImport(String),
     InvalidIrMetadata(String),
     InvalidCaptureMetadata(String),
@@ -744,6 +828,9 @@ impl fmt::Display for LibraryError {
             }
             Self::UnsupportedToneSettingsVersion(version) => {
                 write!(formatter, "unsupported tone-settings version {version}")
+            }
+            Self::InvalidNamImport(message) => {
+                write!(formatter, "invalid NAM import: {message}")
             }
             Self::InvalidIrImport(message) => {
                 write!(formatter, "invalid cabinet IR import: {message}")
@@ -1655,6 +1742,11 @@ const fn decode_hex(byte: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::{Value, json};
+
+    use crate::a2::{
+        A2_CHANNELS, A2_DILATIONS, A2_KERNEL_SIZES, A2_LAYER_COUNT, A2_LEAKY_RELU_SLOPE, A2Model,
+    };
     use crate::model::{REQUIRED_SAMPLE_RATE_HZ, SupportedArchitecture, sha256};
     use crate::wav_io::write_mono_f32_wav;
 
@@ -1708,6 +1800,48 @@ mod tests {
         ModelLibrary::new(ModelLibraryPaths::from_plugin_root(
             directory.0.join("library"),
         ))
+    }
+
+    fn direct_nam(name: &str) -> Vec<u8> {
+        let model = A2Model::zeros();
+        serde_json::to_vec(&json!({
+            "version": "0.7.0",
+            "metadata": {"name": name},
+            "architecture": "WaveNet",
+            "config": {
+                "layers": [{
+                    "input_size": 1,
+                    "condition_size": 1,
+                    "head": {
+                        "out_channels": 1,
+                        "kernel_size": 16,
+                        "bias": true
+                    },
+                    "channels": A2_CHANNELS,
+                    "kernel_sizes": A2_KERNEL_SIZES,
+                    "dilations": A2_DILATIONS,
+                    "activation": (0..A2_LAYER_COUNT)
+                        .map(|_| json!({
+                            "type": "LeakyReLU",
+                            "negative_slope": A2_LEAKY_RELU_SLOPE
+                        }))
+                        .collect::<Vec<_>>(),
+                    "bottleneck": A2_CHANNELS,
+                    "head1x1": {"active": false},
+                    "layer1x1": {"active": true, "groups": 1},
+                    "groups_input": 1,
+                    "groups_input_mixin": 1,
+                    "gating_mode": vec!["none"; A2_LAYER_COUNT],
+                    "secondary_activation": vec![Value::Null; A2_LAYER_COUNT],
+                    "slimmable": null
+                }],
+                "head": null,
+                "head_scale": 0.01
+            },
+            "weights": model.weights.to_official_weight_vec(),
+            "sample_rate": 48000
+        }))
+        .unwrap()
     }
 
     #[test]
@@ -1804,6 +1938,65 @@ mod tests {
         assert!(corrupt_scan.entries.is_empty());
         assert_eq!(corrupt_scan.issues.len(), 1);
         assert_eq!(corrupt_scan.issues[0].path, imported.archived_path);
+    }
+
+    #[test]
+    fn nam_import_is_source_preserving_content_addressed_and_idempotent() {
+        let directory = TestDirectory::new();
+        let library = test_library(&directory);
+        library.ensure_directories().unwrap();
+        let source = directory.0.join("external model.nam");
+        let source_bytes = direct_nam("External A2");
+        fs::write(&source, &source_bytes).unwrap();
+
+        let imported = library.import_nam(&source).unwrap();
+        assert_eq!(fs::read(&source).unwrap(), source_bytes);
+        assert_eq!(imported.entry.metadata.display_name, "External A2");
+        assert_eq!(imported.notice, None);
+        assert_eq!(
+            imported.entry.path.file_name().unwrap().to_string_lossy(),
+            format!("{}.motmodel", imported.entry.reference.sha256)
+        );
+        assert_eq!(
+            imported
+                .provenance_path
+                .file_name()
+                .unwrap()
+                .to_string_lossy(),
+            format!("{}.nam-import.json", imported.entry.reference.sha256)
+        );
+        let provenance: Value =
+            serde_json::from_slice(&fs::read(&imported.provenance_path).unwrap()).unwrap();
+        assert_eq!(
+            provenance["source_sha256"],
+            sha256(&source_bytes).to_string()
+        );
+        assert_eq!(
+            provenance["selection"]["runtime_variant"],
+            json!("A2 C3 Nano")
+        );
+        let stored = MotModel::read(&imported.entry.path).unwrap();
+        assert_eq!(stored.content_sha256(), imported.entry.reference.sha256);
+        assert_eq!(stored.metadata(), &imported.entry.metadata);
+
+        let renamed_source = directory.0.join("same bytes renamed.nam");
+        fs::write(&renamed_source, &source_bytes).unwrap();
+        let repeated = library.import_nam(&renamed_source).unwrap();
+        assert_eq!(repeated.entry.path, imported.entry.path);
+        assert_eq!(repeated.entry.reference, imported.entry.reference);
+        assert_eq!(repeated.provenance_path, imported.provenance_path);
+        let model_count = fs::read_dir(&library.paths().models)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .and_then(std::ffi::OsStr::to_str)
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("motmodel"))
+            })
+            .count();
+        assert_eq!(model_count, 1);
     }
 
     #[test]

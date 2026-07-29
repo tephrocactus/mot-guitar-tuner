@@ -14,6 +14,7 @@ pub mod capture;
 pub mod capture_asset;
 pub mod model;
 pub mod model_library;
+pub mod nam_import;
 pub mod runtime;
 pub mod signal_chain;
 pub mod split_capture;

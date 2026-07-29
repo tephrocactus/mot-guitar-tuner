@@ -1528,7 +1528,7 @@ dependencies = [
 
 [[package]]
 name = "mot-generator"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "crossbeam-queue",
  "egui",
@@ -1541,7 +1541,7 @@ dependencies = [
 
 [[package]]
 name = "mot-player"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "crossbeam-queue",
  "egui",
@@ -1555,7 +1555,7 @@ dependencies = [
 
 [[package]]
 name = "mot-trainer"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "crossbeam-queue",
  "egui",
@@ -1568,7 +1568,7 @@ dependencies = [
 
 [[package]]
 name = "mot-tuner"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "egui",
  "mot-core",

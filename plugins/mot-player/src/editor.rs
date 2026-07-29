@@ -12,7 +12,7 @@ use truce::prelude::*;
 use truce_egui::EditorUi;
 
 use mot_ui::{
-    ACCENT, DEEP, DIM, ERROR, KnobSpec, SUCCESS, TEXT, WAITING, accent_button, background_frame,
+    ACCENT, DIM, ERROR, KnobSpec, SUCCESS, TEXT, WAITING, accent_button, background_frame,
     danger_button, field_label, ghost_button, panel, parameter_knob, section_label, status_text,
 };
 
@@ -116,9 +116,14 @@ impl EditorUi<MotPlayerParams> for MotPlayerUi {
                 fixed_vertical_panel(ui, Vec2::new(310.0, content_height), |ui| {
                     model_browser(ui, context, &mut state);
                 });
-                ui.add_space(6.0);
                 fixed_vertical_panel(ui, Vec2::new(ui.available_width(), content_height), |ui| {
-                    player_controls(ui, context, &mut state);
+                    egui::ScrollArea::vertical()
+                        .id_salt("mot_player_controls")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            player_controls(ui, context, &mut state);
+                        });
                 });
             });
         });
@@ -355,7 +360,6 @@ fn model_browser(
                 );
             });
         });
-        ui.add_space(4.0);
 
         let selected_id = read_shared_string(&context.selected_model_id);
         let selected_hash = read_shared_string(&context.selected_model_sha256);
@@ -402,7 +406,7 @@ fn model_browser(
                     let button = if selected {
                         mot_ui::selected_model_button(label)
                     } else {
-                        ghost_button(label).fill(DEEP)
+                        ghost_button(label)
                     };
                     let response = ui.add_sized([ui.available_width(), 54.0], button);
                     if response.clicked() && !selected {
@@ -415,7 +419,6 @@ fn model_browser(
                 }
             });
 
-        ui.add_space(4.0);
         ui.columns(2, |columns| {
             let busy = context.library_control.is_busy();
             if columns[0]
@@ -467,7 +470,6 @@ fn model_browser(
     });
 
     if let Some(pending) = state.pending_model.clone() {
-        ui.add_space(6.0);
         egui::Frame::new()
             .fill(Color32::from_rgb(47, 37, 19))
             .stroke(egui::Stroke::new(1.0_f32, WAITING.linear_multiply(0.55)))
@@ -539,9 +541,7 @@ fn player_controls(
             );
         }
 
-        ui.add_space(8.0);
         ui.separator();
-        ui.add_space(6.0);
         ui.horizontal(|ui| {
             runtime_status(ui, context);
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -569,7 +569,6 @@ fn player_controls(
         });
     });
 
-    ui.add_space(10.0);
     panel().show(ui, |ui| {
         ui.columns(3, |columns| {
             player_parameter(
@@ -611,10 +610,8 @@ fn player_controls(
         });
     });
 
-    ui.add_space(10.0);
     ir_section(ui, context, state);
     if let Some(message) = &state.message {
-        ui.add_space(8.0);
         ui.label(RichText::new(message).small().color(WAITING));
     }
 }
@@ -651,7 +648,7 @@ fn runtime_status(ui: &mut egui::Ui, context: &PluginContext<MotPlayerParams>) {
     } else {
         label
     };
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         ui.label(field_label("RUNTIME"));
         ui.label(status_text(visible_label, color));
         ui.label(RichText::new(detail).small().monospace().color(color));
@@ -685,7 +682,6 @@ fn player_parameter(
     parameter: PlayerParameter<'_>,
 ) {
     ui.vertical_centered(|ui| {
-        ui.set_width((ui.available_width() / 3.0).max(142.0));
         let mut edited = parameter.value;
         let value_text = if parameter.percent {
             format!("{edited:.0}%")

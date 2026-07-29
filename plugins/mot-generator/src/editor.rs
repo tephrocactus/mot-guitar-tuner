@@ -46,9 +46,8 @@ impl EditorUi<GeneratorParams> for GeneratorUi {
                 );
 
                 ui.horizontal(|ui| {
-                    ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
                         ui.label(mot_ui::field_label("STATUS"));
-                        ui.add_space(4.0);
                         ui.label(mot_ui::status_text(status_label, status_color));
                     });
 
@@ -88,7 +87,6 @@ impl EditorUi<GeneratorParams> for GeneratorUi {
                 });
 
                 if armed && matches!(status_code, 0..=2) {
-                    ui.add_space(mot_ui::ROW_GAP);
                     ui.label(
                         RichText::new(
                             "Now click Play in a DAW's transport panel. Stop playback if already playing",
@@ -98,7 +96,6 @@ impl EditorUi<GeneratorParams> for GeneratorUi {
                 }
 
                 if armed {
-                    ui.add_space(mot_ui::ROW_GAP);
                     let progress = context.get_meter(P::Progress).clamp(0.0, 1.0);
                     mot_ui::progress(
                         ui,

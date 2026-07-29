@@ -4,8 +4,8 @@
 //! never called from a plug-in's real-time callback.
 
 use egui::{
-    Align, Align2, Button, Color32, FontId, Frame, Layout, Response, RichText, Sense, Shape,
-    Stroke, Ui, Vec2, WidgetText, epaint::PathStroke,
+    Align, Align2, Button, Color32, CursorIcon, FontId, Frame, Layout, Response, RichText, Sense,
+    Shape, Stroke, Ui, Vec2, Widget, WidgetText, epaint::PathStroke,
 };
 
 pub const BACKGROUND: Color32 = Color32::from_rgb(8, 11, 13);
@@ -49,6 +49,7 @@ pub fn apply(ui: &mut Ui) {
     visuals.selection.bg_fill = Color32::from_rgb(16, 55, 57);
     visuals.selection.stroke = Stroke::new(1.0_f32, ACCENT);
     visuals.extreme_bg_color = DEEP;
+    visuals.interact_cursor = Some(CursorIcon::PointingHand);
 
     ui.spacing_mut().item_spacing = Vec2::new(ROW_GAP, ROW_GAP);
     ui.spacing_mut().button_padding = Vec2::new(12.0, 6.0);
@@ -95,9 +96,7 @@ pub fn header(
         ui.label(RichText::new(suffix).monospace().color(DIM));
         ui.with_layout(Layout::right_to_left(Align::Center), add_right);
     });
-    ui.add_space(12.0);
     ui.separator();
-    ui.add_space(12.0);
 }
 
 pub fn section_label(label: impl Into<String>) -> RichText {
@@ -123,33 +122,142 @@ pub fn status_text(label: impl Into<String>, color: Color32) -> RichText {
         .color(color)
 }
 
-pub fn ghost_button(label: impl Into<WidgetText>) -> Button<'static> {
-    Button::new(label)
-        .fill(RAISED)
-        .stroke(Stroke::new(1.0_f32, LINE))
-        .corner_radius(CONTROL_RADIUS)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ButtonTone {
+    Neutral,
+    Accent,
+    Danger,
+    Selected,
 }
 
-pub fn accent_button(label: impl Into<WidgetText>) -> Button<'static> {
-    Button::new(label)
-        .fill(ACCENT)
-        .stroke(Stroke::NONE)
-        .corner_radius(CONTROL_RADIUS)
+/// A Signal Lab button whose idle, hover and pressed states all remain visible.
+///
+/// `egui::Button::fill` and `egui::Button::stroke` intentionally disable the
+/// widget's state-dependent visuals. Keeping the tone in this wrapper lets the
+/// whole suite use colored buttons without losing hover or pressed feedback.
+pub struct SignalButton {
+    label: WidgetText,
+    tone: ButtonTone,
+    min_size: Vec2,
+    fill_override: Option<Color32>,
 }
 
-pub fn danger_button(label: impl Into<WidgetText>) -> Button<'static> {
-    Button::new(label)
-        .fill(ERROR.linear_multiply(0.78))
-        .stroke(Stroke::NONE)
-        .corner_radius(CONTROL_RADIUS)
+impl SignalButton {
+    fn new(label: impl Into<WidgetText>, tone: ButtonTone) -> Self {
+        Self {
+            label: label.into(),
+            tone,
+            min_size: Vec2::ZERO,
+            fill_override: None,
+        }
+    }
+
+    pub fn min_size(mut self, min_size: Vec2) -> Self {
+        self.min_size = min_size;
+        self
+    }
+
+    /// Set a custom idle fill while retaining derived hover/pressed colors.
+    pub fn fill(mut self, fill: impl Into<Color32>) -> Self {
+        self.fill_override = Some(fill.into());
+        self
+    }
 }
 
-pub fn selected_model_button(label: impl Into<WidgetText>) -> Button<'static> {
-    Button::new(label)
-        .fill(Color32::from_rgb(16, 37, 39))
-        .stroke(Stroke::new(1.0_f32, ACCENT.linear_multiply(0.55)))
-        .corner_radius(CONTROL_RADIUS)
-        .selected(true)
+impl Widget for SignalButton {
+    fn ui(self, ui: &mut Ui) -> Response {
+        ui.scope(|ui| {
+            configure_button_tone(ui, self.tone, self.fill_override);
+            ui.add(
+                Button::new(self.label)
+                    .corner_radius(CONTROL_RADIUS)
+                    .min_size(self.min_size),
+            )
+        })
+        .inner
+    }
+}
+
+fn configure_button_tone(ui: &mut Ui, tone: ButtonTone, fill_override: Option<Color32>) {
+    let visuals = ui.visuals_mut();
+    let (idle, hovered, active, idle_stroke, text_color) = match tone {
+        ButtonTone::Neutral => {
+            let idle = fill_override.unwrap_or(RAISED);
+            (
+                idle,
+                mix_color(idle, ACCENT, 0.16),
+                mix_color(idle, ACCENT, 0.32),
+                LINE,
+                TEXT,
+            )
+        }
+        ButtonTone::Accent => (
+            ACCENT,
+            mix_color(ACCENT, Color32::WHITE, 0.18),
+            mix_color(ACCENT, BACKGROUND, 0.24),
+            ACCENT.linear_multiply(0.75),
+            BACKGROUND,
+        ),
+        ButtonTone::Danger => {
+            let idle = ERROR.linear_multiply(0.78);
+            (
+                idle,
+                mix_color(idle, Color32::WHITE, 0.14),
+                mix_color(idle, BACKGROUND, 0.22),
+                ERROR.linear_multiply(0.72),
+                TEXT,
+            )
+        }
+        ButtonTone::Selected => {
+            let idle = Color32::from_rgb(16, 37, 39);
+            (
+                idle,
+                Color32::from_rgb(21, 49, 51),
+                Color32::from_rgb(12, 58, 58),
+                ACCENT.linear_multiply(0.55),
+                TEXT,
+            )
+        }
+    };
+
+    visuals.override_text_color = Some(text_color);
+    visuals.widgets.inactive.weak_bg_fill = idle;
+    visuals.widgets.inactive.bg_fill = idle;
+    visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, idle_stroke);
+    visuals.widgets.hovered.weak_bg_fill = hovered;
+    visuals.widgets.hovered.bg_fill = hovered;
+    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, ACCENT);
+    visuals.widgets.active.weak_bg_fill = active;
+    visuals.widgets.active.bg_fill = active;
+    visuals.widgets.active.bg_stroke = Stroke::new(1.0_f32, ACCENT);
+}
+
+fn mix_color(base: Color32, tint: Color32, amount: f32) -> Color32 {
+    let amount = amount.clamp(0.0, 1.0);
+    let base = base.to_array();
+    let tint = tint.to_array();
+    Color32::from_rgba_unmultiplied(
+        (f32::from(base[0]) + (f32::from(tint[0]) - f32::from(base[0])) * amount).round() as u8,
+        (f32::from(base[1]) + (f32::from(tint[1]) - f32::from(base[1])) * amount).round() as u8,
+        (f32::from(base[2]) + (f32::from(tint[2]) - f32::from(base[2])) * amount).round() as u8,
+        (f32::from(base[3]) + (f32::from(tint[3]) - f32::from(base[3])) * amount).round() as u8,
+    )
+}
+
+pub fn ghost_button(label: impl Into<WidgetText>) -> SignalButton {
+    SignalButton::new(label, ButtonTone::Neutral)
+}
+
+pub fn accent_button(label: impl Into<WidgetText>) -> SignalButton {
+    SignalButton::new(label, ButtonTone::Accent)
+}
+
+pub fn danger_button(label: impl Into<WidgetText>) -> SignalButton {
+    SignalButton::new(label, ButtonTone::Danger)
+}
+
+pub fn selected_model_button(label: impl Into<WidgetText>) -> SignalButton {
+    SignalButton::new(label, ButtonTone::Selected)
 }
 
 pub fn progress(ui: &mut Ui, fraction: f32, text: impl Into<WidgetText>) -> Response {

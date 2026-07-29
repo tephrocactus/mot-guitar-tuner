@@ -24,10 +24,7 @@ impl EditorUi<MotTunerParams> for MotTunerUi {
             mot_ui::header(ui, "MOT TUNER", VERSION, false, |ui| {
                 let muted = context.mute.value();
                 let button = if muted {
-                    egui::Button::new(RichText::new("MUTE").color(mot_ui::BACKGROUND))
-                        .fill(mot_ui::ERROR)
-                        .stroke(Stroke::NONE)
-                        .corner_radius(mot_ui::CONTROL_RADIUS)
+                    mot_ui::danger_button(RichText::new("MUTE").color(mot_ui::BACKGROUND))
                 } else {
                     mot_ui::ghost_button("MUTE")
                 };
@@ -40,7 +37,8 @@ impl EditorUi<MotTunerParams> for MotTunerUi {
             let strobe_height =
                 (ui.available_height() - table_height - mot_ui::SECTION_GAP).max(280.0);
             strobe(ui, context, strobe_height);
-            ui.add_space(mot_ui::SECTION_GAP);
+            let extra_section_gap = (mot_ui::SECTION_GAP - ui.spacing().item_spacing.y).max(0.0);
+            ui.add_space(extra_section_gap);
             string_editor(ui, context);
         });
     }
@@ -150,7 +148,6 @@ fn string_editor(ui: &mut egui::Ui, context: &PluginContext<MotTunerParams>) {
             ui.label(mot_ui::section_label("STRING OFFSETS"));
             offset_switch(ui, context);
         });
-        ui.add_space(mot_ui::ROW_GAP);
 
         egui::Grid::new("mot_tuner_string_grid")
             .num_columns(3)
@@ -176,11 +173,9 @@ fn string_editor(ui: &mut egui::Ui, context: &PluginContext<MotTunerParams>) {
                     ui.label(string_label);
 
                     ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
                         if ui
-                            .add_enabled(
-                                note_values[index] > 0,
-                                egui::Button::new("◀").frame(false),
-                            )
+                            .add_enabled(note_values[index] > 0, note_step_button("◀"))
                             .clicked()
                         {
                             let previous = note_values[index] - 1;
@@ -200,10 +195,7 @@ fn string_editor(ui: &mut egui::Ui, context: &PluginContext<MotTunerParams>) {
                             ),
                         );
                         if ui
-                            .add_enabled(
-                                note_values[index] < 127,
-                                egui::Button::new("▶").frame(false),
-                            )
+                            .add_enabled(note_values[index] < 127, note_step_button("▶"))
                             .clicked()
                         {
                             let next = note_values[index] + 1;
@@ -238,15 +230,43 @@ fn offset_switch(ui: &mut egui::Ui, context: &PluginContext<MotTunerParams>) {
         if response.clicked() {
             context.automate(P::OffsetsEnabled, if enabled { 0.0 } else { 1.0 });
         }
-        response.on_hover_text("Temporarily compare reference notes against pure 12-TET");
+        let response =
+            response.on_hover_text("Temporarily compare reference notes against pure 12-TET");
+        let hovered = response.hovered();
+        let pressed = response.is_pointer_button_down_on();
+        if hovered {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
 
-        let track_color = if enabled {
+        let resting_track = if enabled {
             Color32::from_rgb(31, 107, 100)
         } else {
             mot_ui::LINE
         };
+        let track_color = if pressed {
+            Color32::from_rgb(16, 80, 78)
+        } else if hovered {
+            resting_track.linear_multiply(1.22)
+        } else {
+            resting_track
+        };
         ui.painter()
             .rect_filled(rect, rect.height() / 2.0, track_color);
+        ui.painter().rect_stroke(
+            rect,
+            rect.height() / 2.0,
+            Stroke::new(
+                1.0_f32,
+                if pressed {
+                    mot_ui::ACCENT
+                } else if hovered {
+                    mot_ui::ACCENT.linear_multiply(0.72)
+                } else {
+                    mot_ui::LINE
+                },
+            ),
+            StrokeKind::Inside,
+        );
         let knob_x = if enabled {
             rect.right() - rect.height() / 2.0
         } else {
@@ -255,7 +275,15 @@ fn offset_switch(ui: &mut egui::Ui, context: &PluginContext<MotTunerParams>) {
         ui.painter().circle_filled(
             egui::pos2(knob_x, rect.center().y),
             8.5,
-            if enabled { mot_ui::ACCENT } else { mot_ui::DIM },
+            if pressed {
+                mot_ui::TEXT
+            } else if enabled {
+                mot_ui::ACCENT
+            } else if hovered {
+                mot_ui::TEXT
+            } else {
+                mot_ui::DIM
+            },
         );
         ui.label(
             RichText::new(if enabled { "ON" } else { "OFF" })
@@ -263,6 +291,13 @@ fn offset_switch(ui: &mut egui::Ui, context: &PluginContext<MotTunerParams>) {
                 .color(if enabled { mot_ui::ACCENT } else { mot_ui::DIM }),
         );
     });
+}
+
+fn note_step_button(label: &'static str) -> egui::Button<'static> {
+    egui::Button::new(RichText::new(label).monospace().strong())
+        .frame_when_inactive(false)
+        .corner_radius(mot_ui::CONTROL_RADIUS)
+        .min_size(Vec2::new(28.0, 24.0))
 }
 
 fn decode_string(encoded: f32) -> Option<usize> {

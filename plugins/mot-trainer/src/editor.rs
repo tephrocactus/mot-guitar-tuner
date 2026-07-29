@@ -58,10 +58,10 @@ impl EditorUi<MotTrainerParams> for MotTrainerUi {
 
             let content_height = ui.available_height();
             ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = COLUMN_GAP;
                 fixed_vertical_panel(ui, Vec2::new(MODEL_BROWSER_WIDTH, content_height), |ui| {
                     model_browser(ui, context, &mut state)
                 });
-                ui.add_space(COLUMN_GAP);
                 fixed_vertical_panel(ui, Vec2::new(ui.available_width(), content_height), |ui| {
                     main_workspace(ui, context, &mut state)
                 });
@@ -284,11 +284,15 @@ fn main_workspace(
         .auto_shrink([false, false])
         .show(ui, |ui| {
             model_configuration(ui, context, state);
-            ui.add_space(mot_ui::SECTION_GAP);
+            add_vertical_gap(ui, mot_ui::SECTION_GAP);
             status_panel(ui, context);
-            ui.add_space(mot_ui::SECTION_GAP);
+            add_vertical_gap(ui, mot_ui::SECTION_GAP);
             metadata_editor(ui, context);
         });
+}
+
+fn add_vertical_gap(ui: &mut egui::Ui, total: f32) {
+    ui.add_space((total - ui.spacing().item_spacing.y).max(0.0));
 }
 
 fn full_width_panel<R>(

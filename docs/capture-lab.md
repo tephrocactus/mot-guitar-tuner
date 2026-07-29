@@ -56,9 +56,10 @@ MOT GENERATOR
 
 MOT GENERATOR ignores track input. MOT TRAINER records its mono input and
 outputs silence by default to reduce feedback risk. Enable `MONITOR` in the
-Trainer header to pass the Return to its output for auditioning; this does not
-change the signal recorded for capture or used for training. DAW recording
-itself is optional.
+Trainer header after arming to audition the Return. Audio passes only during
+the recording window; the control is locked before arming and after capture.
+This does not change the signal recorded for capture or used for training.
+DAW recording itself is optional.
 
 Disable every stage that should not become part of the learned amp:
 

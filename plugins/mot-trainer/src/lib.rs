@@ -673,7 +673,11 @@ impl PluginLogic for MotTrainer {
                     state.recorder_active = false;
                 }
             } else {
-                render_monitor_output(input, output, params.monitor.value());
+                let monitor_available = state.recorder_active
+                    && state.recorder.as_ref().is_some_and(|recorder| {
+                        monitor_return_available(recorder.state(), transport.playing)
+                    });
+                render_monitor_output(input, output, params.monitor.value() && monitor_available);
                 if state.recorder_active
                     && let Some(recorder) = &mut state.recorder
                 {
@@ -728,6 +732,20 @@ fn render_monitor_output(input: &[f32], output: &mut [f32], monitor: bool) {
         output.copy_from_slice(input);
     } else {
         output.fill(0.0);
+    }
+}
+
+fn monitor_return_available(capture_state: SplitCaptureState, transport_playing: bool) -> bool {
+    match capture_state {
+        SplitCaptureState::WaitingForTransport => transport_playing,
+        SplitCaptureState::PreRoll { .. }
+        | SplitCaptureState::Program { .. }
+        | SplitCaptureState::Tail { .. }
+        | SplitCaptureState::AlignmentMargin { .. } => true,
+        SplitCaptureState::Idle
+        | SplitCaptureState::Armed
+        | SplitCaptureState::Ready
+        | SplitCaptureState::Invalid(_) => false,
     }
 }
 
@@ -1296,6 +1314,26 @@ mod tests {
 
         render_monitor_output(&input, &mut output, true);
         assert_eq!(output, input);
+    }
+
+    #[test]
+    fn monitor_audio_is_gated_to_the_recording_window() {
+        assert!(!monitor_return_available(SplitCaptureState::Armed, true));
+        assert!(!monitor_return_available(
+            SplitCaptureState::WaitingForTransport,
+            false
+        ));
+        assert!(monitor_return_available(
+            SplitCaptureState::WaitingForTransport,
+            true
+        ));
+        assert!(monitor_return_available(
+            SplitCaptureState::PreRoll {
+                completed_samples: 0
+            },
+            true
+        ));
+        assert!(!monitor_return_available(SplitCaptureState::Ready, true));
     }
 
     #[test]

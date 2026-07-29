@@ -100,18 +100,27 @@ fn header(
                 .color(dim),
         );
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            let monitoring = context.monitor.value();
-            let button = egui::Button::new(RichText::new("MONITOR").color(if monitoring {
+            let available = monitor_control_available(context.control.status());
+            let requested = context.monitor.value();
+            if !available && requested {
+                context.automate(P::Monitor, 0.0);
+            }
+            let monitoring = available && requested;
+            let label_color = if monitoring {
                 background
-            } else {
+            } else if available {
                 text
-            }))
-            .fill(if monitoring {
-                accent
             } else {
-                Color32::from_rgb(42, 48, 52)
-            });
-            if ui.add(button).clicked() {
+                dim
+            };
+            let button = egui::Button::new(RichText::new("MONITOR").color(label_color)).fill(
+                if monitoring {
+                    accent
+                } else {
+                    Color32::from_rgb(42, 48, 52)
+                },
+            );
+            if ui.add_enabled(available, button).clicked() {
                 context.automate(P::Monitor, if monitoring { 0.0 } else { 1.0 });
             }
         });
@@ -438,6 +447,13 @@ fn model_editing_enabled(status: TrainerStatus) -> bool {
     )
 }
 
+fn monitor_control_available(status: TrainerStatus) -> bool {
+    matches!(
+        status,
+        TrainerStatus::Armed | TrainerStatus::Waiting | TrainerStatus::Recording
+    )
+}
+
 fn capture_details_visible(status: TrainerStatus, progress: f32) -> bool {
     progress > 0.0
         || matches!(
@@ -633,5 +649,15 @@ mod tests {
         assert_eq!(format_duration(0.0), "0:00");
         assert_eq!(format_duration(65.4), "1:05");
         assert_eq!(format_duration(3_661.0), "1:01:01");
+    }
+
+    #[test]
+    fn monitor_control_is_available_only_around_capture() {
+        assert!(!monitor_control_available(TrainerStatus::Ready));
+        assert!(monitor_control_available(TrainerStatus::Armed));
+        assert!(monitor_control_available(TrainerStatus::Waiting));
+        assert!(monitor_control_available(TrainerStatus::Recording));
+        assert!(!monitor_control_available(TrainerStatus::Captured));
+        assert!(!monitor_control_available(TrainerStatus::Training));
     }
 }

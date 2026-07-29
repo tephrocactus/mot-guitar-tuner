@@ -16,7 +16,7 @@ use truce_egui::EguiEditor;
 
 use editor::{GeneratorUi, WINDOW_SIZE};
 
-pub const VERSION: &str = "0.4.5";
+pub const VERSION: &str = "0.4.6";
 const READY_CAPACITY: usize = 2;
 const RETIRED_CAPACITY: usize = 4;
 

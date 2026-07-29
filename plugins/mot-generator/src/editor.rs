@@ -10,6 +10,8 @@ use crate::{
 };
 
 pub(crate) const WINDOW_SIZE: (u32, u32) = (720, 320);
+const EDITOR_MARGIN: f32 = 22.0;
+const PANEL_MARGIN: f32 = 20.0;
 const VERTICAL_GAP: f32 = 16.0;
 
 pub(crate) struct GeneratorUi;
@@ -26,12 +28,12 @@ impl EditorUi<GeneratorParams> for GeneratorUi {
         ui.visuals_mut().panel_fill = background;
         ui.visuals_mut().override_text_color = Some(text);
         let editor_rect = ui.max_rect();
-        let content_width = (editor_rect.width() - 44.0).max(0.0);
+        let content_width = (editor_rect.width() - EDITOR_MARGIN * 2.0).max(0.0);
         ui.painter().rect_filled(editor_rect, 0.0, background);
 
         egui::Frame::new()
             .fill(background)
-            .inner_margin(22.0)
+            .inner_margin(EDITOR_MARGIN)
             .show(ui, |ui| {
                 ui.set_min_width(content_width);
                 ui.horizontal(|ui| {
@@ -47,14 +49,16 @@ impl EditorUi<GeneratorParams> for GeneratorUi {
                     );
                 });
                 ui.add_space(VERTICAL_GAP);
+                let panel_height = ui.available_height();
 
                 egui::Frame::new()
                     .fill(panel)
                     .stroke(Stroke::new(1.0_f32, Color32::from_rgb(44, 52, 58)))
                     .corner_radius(10.0)
-                    .inner_margin(20.0)
+                    .inner_margin(PANEL_MARGIN)
                     .show(ui, |ui| {
-                        ui.set_min_width((content_width - 40.0).max(0.0));
+                        ui.set_min_width((content_width - PANEL_MARGIN * 2.0).max(0.0));
+                        ui.set_min_height((panel_height - PANEL_MARGIN * 2.0).max(0.0));
                         let load_status = context.asset_control.status();
                         let (status_label, status_color) =
                             status_label(context, load_status, cyan, text_dim);

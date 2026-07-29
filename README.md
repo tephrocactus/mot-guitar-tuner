@@ -49,6 +49,25 @@ cargo truce install --vst3 --user -p mot-tuner
 
 Release builds use optimization level 3, full LTO, and one codegen unit.
 
+## PKG installer
+
+Build a current-user macOS installer:
+
+```bash
+./packaging/build-pkg.sh
+```
+
+The generated package is written to `dist/` and installs `MOT TUNER.vst3` into
+`~/Library/Audio/Plug-Ins/VST3` for the current user without an administrator
+prompt. The wrapper uses the native `cargo-truce` packager, builds only ARM64
+VST3, disables notarization for this private build, and verifies that the
+payload contains exactly one Tuner.
+
+Without Apple `Developer ID Application` and `Developer ID Installer`
+certificates, the VST3 is ad-hoc signed and the PKG is unsigned. That is
+sufficient for local private use, but a downloaded copy may require
+Control-click → Open or approval in Privacy & Security.
+
 ## Validation
 
 ```bash

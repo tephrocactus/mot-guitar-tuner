@@ -1,4 +1,5 @@
 /target
+/dist
 /captures/**/*.aif
 /captures/**/*.aiff
 /captures/**/*.wav

@@ -151,15 +151,22 @@ impl EditorUi<MotStrobeParams> for MotStrobeUi {
                 tab_bar(ui, &mut state, cyan);
                 ui.add_space(12.0);
 
-                match state.tab {
-                    EditorTab::Amp => {
-                        amp_tab(ui, context, &mut state, panel, panel_alt, cyan, text_dim);
+                // Every page gets the same hard viewport. Only the selected
+                // page is instantiated, and oversized child content cannot
+                // paint into the space of another page.
+                let tab_viewport = ui.available_rect_before_wrap();
+                ui.scope(|ui| {
+                    ui.shrink_clip_rect(tab_viewport);
+                    match state.tab {
+                        EditorTab::Amp => {
+                            amp_tab(ui, context, &mut state, panel, panel_alt, cyan, text_dim);
+                        }
+                        EditorTab::Tuner => tuner_tab(ui, context, panel, cyan, text_dim),
+                        EditorTab::Capture => {
+                            capture_tab(ui, context, &mut state, panel, panel_alt, cyan, text_dim);
+                        }
                     }
-                    EditorTab::Tuner => tuner_tab(ui, context, panel, cyan, text_dim),
-                    EditorTab::Capture => {
-                        capture_tab(ui, context, &mut state, panel, panel_alt, cyan, text_dim);
-                    }
-                }
+                });
             });
 
         ui.ctx().data_mut(|data| data.insert_temp(state_id, state));
@@ -385,7 +392,7 @@ fn header(
                 .color(accent),
         );
         ui.label(
-            RichText::new("0.3.0  •  MONO  •  48 kHz  •  ZERO LATENCY")
+            RichText::new("0.3.1  •  MONO  •  48 kHz  •  ZERO LATENCY")
                 .monospace()
                 .color(text_dim),
         );
@@ -425,6 +432,22 @@ fn tab_bar(ui: &mut egui::Ui, state: &mut EditorState, accent: Color32) {
     ui.separator();
 }
 
+fn fixed_vertical_panel<R>(
+    ui: &mut egui::Ui,
+    size: Vec2,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> egui::InnerResponse<R> {
+    ui.allocate_ui_with_layout(size, Layout::top_down(Align::Min), |ui| {
+        // `allocate_ui` normally inherits the surrounding horizontal layout
+        // and may grow to fit a long path. Keep this column vertical, fixed,
+        // and clipped to its allocation instead.
+        let panel_rect = ui.max_rect();
+        ui.set_width(size.x);
+        ui.shrink_clip_rect(panel_rect);
+        add_contents(ui)
+    })
+}
+
 fn amp_tab(
     ui: &mut egui::Ui,
     context: &PluginContext<MotStrobeParams>,
@@ -435,7 +458,7 @@ fn amp_tab(
     text_dim: Color32,
 ) {
     ui.horizontal_top(|ui| {
-        ui.allocate_ui(Vec2::new(350.0, ui.available_height()), |ui| {
+        fixed_vertical_panel(ui, Vec2::new(350.0, ui.available_height()), |ui| {
             model_browser(ui, context, state, panel, panel_alt, accent, text_dim);
         });
         ui.add_space(10.0);
@@ -488,15 +511,18 @@ fn model_browser(
                                 .color(text_dim),
                         );
                         ui.add_space(4.0);
-                        ui.label(
-                            RichText::new(
-                                "~/Library/Application Support/Plut&Mot/\
-                                 MOT Guitar Plugin/Models/",
+                        let library_path =
+                            "~/Library/Application Support/Plut&Mot/MOT Guitar Plugin/Models/";
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(library_path)
+                                    .small()
+                                    .monospace()
+                                    .color(text_dim),
                             )
-                            .small()
-                            .monospace()
-                            .color(text_dim),
-                        );
+                            .truncate(),
+                        )
+                        .on_hover_text(library_path);
                     }
 
                     for entry in models {
@@ -969,7 +995,7 @@ fn capture_tab(
     text_dim: Color32,
 ) {
     ui.horizontal_top(|ui| {
-        ui.allocate_ui(Vec2::new(520.0, ui.available_height()), |ui| {
+        fixed_vertical_panel(ui, Vec2::new(520.0, ui.available_height()), |ui| {
             egui::Frame::new()
                 .fill(panel)
                 .corner_radius(8.0)
@@ -2212,5 +2238,29 @@ mod tests {
             ..renamed
         };
         assert!(!selected_reference_is_current(&params, &other_revision));
+    }
+
+    #[test]
+    fn fixed_panel_stays_vertical_and_within_its_requested_width() {
+        let mut direction = None;
+        let mut response_width = None;
+        egui::__run_test_ui(|ui| {
+            ui.set_width(800.0);
+            ui.horizontal(|ui| {
+                let response = fixed_vertical_panel(ui, Vec2::new(350.0, 120.0), |panel_ui| {
+                    direction = Some(panel_ui.layout().main_dir);
+                    panel_ui.add(
+                        egui::Label::new("a/very/long/model/library/path/".repeat(32)).truncate(),
+                    );
+                });
+                response_width = Some(response.response.rect.width());
+            });
+        });
+
+        assert_eq!(direction, Some(egui::Direction::TopDown));
+        assert!(
+            response_width.is_some_and(|width| width <= 350.5),
+            "fixed panel expanded to {response_width:?}"
+        );
     }
 }

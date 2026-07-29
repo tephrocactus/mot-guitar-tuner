@@ -1036,7 +1036,7 @@ dependencies = [
 
 [[package]]
 name = "mot-strobe"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "crossbeam-queue",
  "egui",

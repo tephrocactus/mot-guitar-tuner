@@ -277,13 +277,24 @@ fn main_workspace(
         });
 }
 
+fn full_width_panel<R>(
+    ui: &mut egui::Ui,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> egui::InnerResponse<R> {
+    let content_width = (ui.available_width() - mot_ui::PANEL_MARGIN * 2.0).max(0.0);
+    panel().show(ui, |ui| {
+        ui.set_min_width(content_width);
+        add_contents(ui)
+    })
+}
+
 fn model_configuration(
     ui: &mut egui::Ui,
     context: &PluginContext<MotTrainerParams>,
     state: &mut EditorState,
 ) {
     let editing_enabled = model_editing_enabled(context.control.status());
-    panel().show(ui, |ui| {
+    full_width_panel(ui, |ui| {
         ui.label(section_label("MODEL SETUP"));
         egui::Grid::new("mot_trainer_model_setup")
             .num_columns(2)
@@ -338,7 +349,7 @@ fn status_panel(ui: &mut egui::Ui, context: &PluginContext<MotTrainerParams>) {
     let capture_progress = context.get_meter(P::CaptureProgress).clamp(0.0, 1.0);
     let training = context.control.training_snapshot();
 
-    panel().show(ui, |ui| {
+    full_width_panel(ui, |ui| {
         ui.horizontal(|ui| {
             ui.label(field_label("STATUS"));
             ui.label(status_text(status.label(), status_color(status)));

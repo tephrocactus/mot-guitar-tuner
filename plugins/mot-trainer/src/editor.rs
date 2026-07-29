@@ -282,7 +282,6 @@ fn status_panel(
 ) {
     let status = context.control.status();
     let capture_progress = context.get_meter(P::CaptureProgress).clamp(0.0, 1.0);
-    let peak = context.get_meter(P::ReturnPeak).clamp(0.0, 1.0);
     let training = context.control.training_snapshot();
 
     egui::Frame::new()
@@ -302,32 +301,12 @@ fn status_panel(
                 );
             });
 
-            if capture_details_visible(status, capture_progress, peak) {
+            if capture_details_visible(status, capture_progress) {
                 ui.add_space(ROW_GAP);
                 ui.add(
                     egui::ProgressBar::new(capture_progress)
-                        .text(format!("CAPTURE {:.1}%", capture_progress * 100.0))
+                        .text(format!("RECORDED {:.1}%", capture_progress * 100.0))
                         .fill(Color32::from_rgb(36, 142, 132)),
-                );
-
-                ui.add_space(ROW_GAP);
-                let peak_db = if peak > 0.0 {
-                    20.0 * peak.log10()
-                } else {
-                    f32::NEG_INFINITY
-                };
-                ui.add(
-                    egui::ProgressBar::new(peak)
-                        .text(if peak_db.is_finite() {
-                            format!("RETURN PEAK {peak_db:.1} dBFS")
-                        } else {
-                            "RETURN PEAK −∞ dBFS".to_owned()
-                        })
-                        .fill(if peak > 0.891_250_9 {
-                            Color32::from_rgb(188, 55, 60)
-                        } else {
-                            Color32::from_rgb(36, 142, 132)
-                        }),
                 );
             }
 
@@ -459,14 +438,11 @@ fn model_editing_enabled(status: TrainerStatus) -> bool {
     )
 }
 
-fn capture_details_visible(status: TrainerStatus, progress: f32, peak: f32) -> bool {
+fn capture_details_visible(status: TrainerStatus, progress: f32) -> bool {
     progress > 0.0
-        || peak > 0.0
         || matches!(
             status,
-            TrainerStatus::Armed
-                | TrainerStatus::Waiting
-                | TrainerStatus::Recording
+            TrainerStatus::Recording
                 | TrainerStatus::Captured
                 | TrainerStatus::Aligning
                 | TrainerStatus::Training

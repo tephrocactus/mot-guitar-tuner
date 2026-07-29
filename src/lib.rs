@@ -1,3 +1,5 @@
+mod a2;
+mod a2_train;
 #[cfg(test)]
 mod acceptance;
 mod amp;
@@ -9,7 +11,7 @@ mod model;
 mod model_library;
 mod runtime;
 mod signal_chain;
-mod trainer;
+mod split_capture;
 mod tuner;
 mod wav_io;
 
@@ -87,14 +89,10 @@ pub struct MotStrobeParams {
     #[param(name = "Capture Armed")]
     pub capture_armed: BoolParam,
 
-    #[param(
-        name = "Capture Send Trim",
-        range = "linear(-40, 0)",
-        default = -20
-    )]
+    #[param(name = "Capture Send Trim", range = "linear(-40, 0)", default = 0)]
     pub capture_send_trim: FloatParam,
 
-    #[param(name = "Max Passes", range = "discrete(1, 400)", default = 400)]
+    #[param(name = "Max Epochs", range = "discrete(1, 400)", default = 400)]
     pub max_passes: IntParam,
 
     #[param(name = "IR Processing", range = "discrete(0, 1)", default = 0)]

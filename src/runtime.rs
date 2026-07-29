@@ -13,16 +13,16 @@ use std::path::PathBuf;
 use crossbeam_queue::ArrayQueue;
 use truce::prelude::AudioConfig;
 
+use crate::a2::{A2_MACS_PER_SAMPLE, A2Model, decode_a2_payload};
 use crate::amp::{AmpControls, AmpProcessor, MAX_MODEL_MACS_PER_SAMPLE};
 use crate::cabinet::{CabinetIrImportOptions, CabinetIrMode, CabinetProcessor, PreparedCabinetIr};
 use crate::model::{
-    DIAGONAL_RNN_ARCHITECTURE_ID, DIAGONAL_RNN_ARCHITECTURE_VERSION, ModelMetadata, ModelRef,
-    ModelRuntimeLimits, REQUIRED_SAMPLE_RATE_HZ, SupportedArchitecture, sha256,
+    A2_ARCHITECTURE_ID, A2_ARCHITECTURE_VERSION, ModelMetadata, ModelRef, ModelRuntimeLimits,
+    REQUIRED_SAMPLE_RATE_HZ, SupportedArchitecture, sha256,
 };
 use crate::model_library::{
     IrProcessingMode, IrReference, LibraryError, ModelLibrary, ToneSettings,
 };
-use crate::trainer::{MODEL_ARCHITECTURE_ID, decode_model_payload, model_descriptor};
 use crate::wav_io::{WavError, decode_mono_wav};
 
 pub const DEFAULT_RETIRED_RUNTIME_CAPACITY: usize = 8;
@@ -373,7 +373,7 @@ impl RuntimeLoader {
                 message,
             );
         }
-        let model = match decode_model_payload(container.payload()) {
+        let model = match decode_a2_payload(container.payload()) {
             Ok(model) => model,
             Err(error) => {
                 return corrupt_outcome(
@@ -423,7 +423,7 @@ impl RuntimeLoader {
         );
         let mut amp = AmpProcessor::default();
         amp.reset(&audio_config);
-        if let Err(error) = amp.load_model(model) {
+        if let Err(error) = amp.load_a2_model(model) {
             return corrupt_outcome(
                 generation,
                 RuntimeAsset::Model,
@@ -524,42 +524,36 @@ pub fn tracking_runtime_limits() -> ModelRuntimeLimits {
     ModelRuntimeLimits::new(
         u64::from(MAX_MODEL_MACS_PER_SAMPLE),
         vec![SupportedArchitecture::exact(
-            DIAGONAL_RNN_ARCHITECTURE_ID,
-            DIAGONAL_RNN_ARCHITECTURE_VERSION,
+            A2_ARCHITECTURE_ID,
+            A2_ARCHITECTURE_VERSION,
         )],
     )
 }
 
 fn validate_outer_metadata(metadata: &ModelMetadata) -> Result<(), String> {
-    if DIAGONAL_RNN_ARCHITECTURE_ID != MODEL_ARCHITECTURE_ID {
-        return Err("trainer/runtime architecture constants disagree".to_owned());
-    }
-    if metadata.architecture_id != DIAGONAL_RNN_ARCHITECTURE_ID
-        || metadata.architecture_version != DIAGONAL_RNN_ARCHITECTURE_VERSION
+    if metadata.architecture_id != A2_ARCHITECTURE_ID
+        || metadata.architecture_version != A2_ARCHITECTURE_VERSION
     {
         return Err(format!(
             "container architecture {} v{} is not {} v{}",
             metadata.architecture_id,
             metadata.architecture_version,
-            DIAGONAL_RNN_ARCHITECTURE_ID,
-            DIAGONAL_RNN_ARCHITECTURE_VERSION
+            A2_ARCHITECTURE_ID,
+            A2_ARCHITECTURE_VERSION
         ));
     }
     Ok(())
 }
 
-fn validate_payload_consistency(
-    metadata: &ModelMetadata,
-    model: &crate::amp::CompactCausalModel,
-) -> Result<(), String> {
-    let descriptor = model_descriptor(model);
-    let consistent = descriptor.architecture_id == metadata.architecture_id
-        && descriptor.architecture_version == metadata.architecture_version
-        && descriptor.causal == metadata.causal
-        && descriptor.lookahead_samples == metadata.lookahead_samples
-        && descriptor.runtime_latency_samples == metadata.runtime_latency_samples
-        && descriptor.sample_rate_hz == metadata.sample_rate_hz
-        && u64::from(descriptor.estimated_macs_per_sample) == metadata.estimated_macs_per_sample;
+fn validate_payload_consistency(metadata: &ModelMetadata, model: &A2Model) -> Result<(), String> {
+    let consistent = metadata.architecture_id == A2_ARCHITECTURE_ID
+        && metadata.architecture_version == A2_ARCHITECTURE_VERSION
+        && model.causal == metadata.causal
+        && model.lookahead_samples == metadata.lookahead_samples
+        && model.runtime_latency_samples == metadata.runtime_latency_samples
+        && model.sample_rate_hz == metadata.sample_rate_hz
+        && model.estimated_macs_per_sample == A2_MACS_PER_SAMPLE
+        && u64::from(model.estimated_macs_per_sample) == metadata.estimated_macs_per_sample;
     if consistent {
         Ok(())
     } else {
@@ -706,10 +700,9 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use crate::amp::CompactCausalModel;
-    use crate::model::{ModelMetadata, MotModel};
+    use crate::a2::{A2_HEAD_KERNEL_SIZE, A2Model, encode_a2_payload};
+    use crate::model::{A2_ARCHITECTURE_ID, A2_ARCHITECTURE_VERSION, ModelMetadata, MotModel};
     use crate::model_library::{ModelLibraryPaths, TONE_SETTINGS_VERSION};
-    use crate::trainer::encode_model_payload;
     use crate::wav_io::write_mono_f32_wav;
 
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -749,28 +742,40 @@ mod tests {
         (directory, library, loader)
     }
 
-    fn metadata_for(model: &CompactCausalModel, model_id: &str) -> ModelMetadata {
-        let descriptor = model_descriptor(model);
+    fn identity_a2_model() -> A2Model {
+        let mut model = A2Model::zeros();
+        // A positive/negative LeakyReLU pair reconstructs x exactly apart
+        // from normal f32 rounding. Only the current head tap is active.
+        model.weights.layers[0].input_mixin[0] = 1.0;
+        model.weights.layers[0].input_mixin[1] = -1.0;
+        let reconstruction = 1.0 / 1.01;
+        let current_tap = A2_HEAD_KERNEL_SIZE - 1;
+        model.weights.head[current_tap * 3] = reconstruction / model.weights.head_scale;
+        model.weights.head[current_tap * 3 + 1] = -reconstruction / model.weights.head_scale;
+        model.validate().unwrap();
+        model
+    }
+
+    fn metadata_for(model: &A2Model, model_id: &str) -> ModelMetadata {
         ModelMetadata {
             model_id: model_id.to_owned(),
             display_name: model_id.to_owned(),
-            architecture_id: descriptor.architecture_id.to_owned(),
-            architecture_version: descriptor.architecture_version,
-            sample_rate_hz: descriptor.sample_rate_hz,
-            causal: descriptor.causal,
-            lookahead_samples: descriptor.lookahead_samples,
-            runtime_latency_samples: descriptor.runtime_latency_samples,
-            estimated_macs_per_sample: u64::from(descriptor.estimated_macs_per_sample),
+            architecture_id: A2_ARCHITECTURE_ID.to_owned(),
+            architecture_version: A2_ARCHITECTURE_VERSION,
+            sample_rate_hz: model.sample_rate_hz,
+            causal: model.causal,
+            lookahead_samples: model.lookahead_samples,
+            runtime_latency_samples: model.runtime_latency_samples,
+            estimated_macs_per_sample: u64::from(model.estimated_macs_per_sample),
         }
     }
 
-    fn install_model(
-        library: &ModelLibrary,
-        model_id: &str,
-        model: &CompactCausalModel,
-    ) -> ModelRef {
-        let container =
-            MotModel::new(metadata_for(model, model_id), encode_model_payload(model)).unwrap();
+    fn install_model(library: &ModelLibrary, model_id: &str, model: &A2Model) -> ModelRef {
+        let container = MotModel::new(
+            metadata_for(model, model_id),
+            encode_a2_payload(model).unwrap(),
+        )
+        .unwrap();
         let filename = format!("{model_id}.motmodel");
         container
             .write_new(library.paths().models.join(&filename))
@@ -799,7 +804,7 @@ mod tests {
     #[test]
     fn exact_model_payload_builds_a_zero_latency_runtime() {
         let (_directory, library, loader) = setup();
-        let reference = install_model(&library, "identity", &CompactCausalModel::raw());
+        let reference = install_model(&library, "identity", &identity_a2_model());
         let outcome = loader.load(RuntimeLoadRequest::new(7, reference.clone()));
         assert!(outcome.status.is_ready());
         let mut runtime = extract_ready(outcome.update);
@@ -811,7 +816,9 @@ mod tests {
         let mut scratch = [0.0; 5];
         let mut output = [f32::NAN; 5];
         runtime.process_block(&input, &mut scratch, &mut output);
-        assert_eq!(output, input);
+        for (actual, expected) in output.iter().zip(input) {
+            assert!((*actual - expected).abs() < 1.0e-5);
+        }
     }
 
     #[test]
@@ -832,10 +839,10 @@ mod tests {
     #[test]
     fn outer_and_payload_metadata_must_match() {
         let (_directory, library, loader) = setup();
-        let model = CompactCausalModel::raw();
+        let model = identity_a2_model();
         let mut metadata = metadata_for(&model, "mismatch");
         metadata.estimated_macs_per_sample += 1;
-        let container = MotModel::new(metadata, encode_model_payload(&model)).unwrap();
+        let container = MotModel::new(metadata, encode_a2_payload(&model).unwrap()).unwrap();
         container
             .write_new(library.paths().models.join("mismatch.motmodel"))
             .unwrap();
@@ -862,7 +869,7 @@ mod tests {
     #[test]
     fn library_tone_loads_by_default_and_explicit_daw_tone_wins() {
         let (_directory, library, loader) = setup();
-        let reference = install_model(&library, "identity", &CompactCausalModel::raw());
+        let reference = install_model(&library, "identity", &identity_a2_model());
         let mut saved = ToneSettings::defaults_for(&reference);
         saved.input_gain_db = 6.0;
         saved.tight_percent = 50.0;
@@ -895,7 +902,7 @@ mod tests {
     #[test]
     fn missing_and_hash_mismatched_models_request_safe_mute() {
         let (_directory, library, loader) = setup();
-        let existing = install_model(&library, "identity", &CompactCausalModel::raw());
+        let existing = install_model(&library, "identity", &identity_a2_model());
         let missing = ModelRef {
             model_id: "missing".to_owned(),
             sha256: sha256(b"missing"),
@@ -928,7 +935,7 @@ mod tests {
     #[test]
     fn minimum_phase_auto_trim_ir_preserves_sample_zero_onset() {
         let (directory, library, loader) = setup();
-        let reference = install_model(&library, "identity", &CompactCausalModel::raw());
+        let reference = install_model(&library, "identity", &identity_a2_model());
         let ir_path = directory.0.join("cab.wav");
         let ir_reference = write_ir(&ir_path, &[0.0, 0.0, 1.0, 0.5], REQUIRED_SAMPLE_RATE_HZ);
         let tone = ToneSettings {
@@ -959,7 +966,7 @@ mod tests {
     #[test]
     fn missing_wrong_hash_wrong_rate_and_oversize_irs_are_rejected() {
         let (directory, library, loader) = setup();
-        let reference = install_model(&library, "identity", &CompactCausalModel::raw());
+        let reference = install_model(&library, "identity", &identity_a2_model());
 
         let make_request = |ir_reference: IrReference, path: PathBuf, generation: u64| {
             let tone = ToneSettings {
@@ -1045,7 +1052,7 @@ mod tests {
     #[test]
     fn mailbox_keeps_only_latest_and_returns_retirement_to_loader() {
         let (_directory, library, loader) = setup();
-        let reference = install_model(&library, "identity", &CompactCausalModel::raw());
+        let reference = install_model(&library, "identity", &identity_a2_model());
         let mailbox = RuntimeMailbox::new(2);
         loader.load_and_publish(RuntimeLoadRequest::new(1, reference.clone()), &mailbox);
         loader.load_and_publish(RuntimeLoadRequest::new(2, reference), &mailbox);
@@ -1063,7 +1070,7 @@ mod tests {
     #[test]
     fn retirement_backpressure_returns_ownership_to_audio_caller() {
         let (_directory, library, loader) = setup();
-        let reference = install_model(&library, "identity", &CompactCausalModel::raw());
+        let reference = install_model(&library, "identity", &identity_a2_model());
         let first = extract_ready(
             loader
                 .load(RuntimeLoadRequest::new(1, reference.clone()))
@@ -1085,7 +1092,7 @@ mod tests {
     #[test]
     fn audio_side_mailbox_operations_allocate_nothing() {
         let (_directory, library, loader) = setup();
-        let reference = install_model(&library, "identity", &CompactCausalModel::raw());
+        let reference = install_model(&library, "identity", &identity_a2_model());
         let mailbox = RuntimeMailbox::new(2);
         loader.load_and_publish(RuntimeLoadRequest::new(1, reference), &mailbox);
 

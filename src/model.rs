@@ -22,8 +22,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub const MODEL_FORMAT_VERSION: u16 = 1;
 pub const REQUIRED_SAMPLE_RATE_HZ: u32 = 48_000;
 pub const MAX_MODEL_PAYLOAD_BYTES: usize = 256 * 1024 * 1024;
-pub const DIAGONAL_RNN_ARCHITECTURE_ID: &str = "mot.diagonal-rnn-tanh";
-pub const DIAGONAL_RNN_ARCHITECTURE_VERSION: u32 = 1;
+pub const A2_ARCHITECTURE_ID: &str = "mot.a2-wavenet-c3";
+pub const A2_ARCHITECTURE_VERSION: u32 = 1;
 
 const MODEL_MAGIC: &[u8; 8] = b"MOTMODL\0";
 const FIXED_HEADER_BYTES: usize = 8 + 2 + 2 + 4 + 8;

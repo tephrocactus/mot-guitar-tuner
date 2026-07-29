@@ -392,7 +392,7 @@ fn header(
                 .color(accent),
         );
         ui.label(
-            RichText::new("0.3.2  •  MONO  •  48 kHz  •  ZERO LATENCY")
+            RichText::new("0.4.0  •  MONO  •  48 kHz  •  ZERO LATENCY")
                 .monospace()
                 .color(text_dim),
         );
@@ -1100,7 +1100,7 @@ fn settings_tab(
                             }
                             ui.end_row();
 
-                            ui.label(RichText::new("MAX PASSES").color(text_dim));
+                            ui.label(RichText::new("MAX EPOCHS").color(text_dim));
                             if ui
                                 .add_sized(
                                     [300.0, 20.0],

@@ -1,11 +1,8 @@
-use std::fmt;
-
 use truce::prelude::AudioConfig;
 
-pub const AMP_MODEL_FORMAT_VERSION: u32 = 1;
-pub const AMP_MODEL_SAMPLE_RATE_HZ: u32 = 48_000;
-pub const MAX_MODEL_UNITS: usize = 32;
-pub const MAX_MODEL_MACS_PER_SAMPLE: u32 = 256;
+use crate::a2::{A2_MACS_PER_SAMPLE, A2_SAMPLE_RATE_HZ, A2Error, A2Model, A2Processor};
+
+pub const MAX_MODEL_MACS_PER_SAMPLE: u32 = A2_MACS_PER_SAMPLE;
 
 const PARAMETER_SMOOTHING_SECONDS: f32 = 0.005;
 const TIGHT_CORNER_HZ: f32 = 115.0;
@@ -45,139 +42,6 @@ impl AmpControls {
         }
     }
 }
-
-/// A compact strictly-causal recurrent model.
-///
-/// This representation is deliberately fixed-size. It can be deserialized and
-/// validated on a loader thread, then moved into a complete `AmpProcessor`
-/// runtime without allocating in the audio callback. For sample `n`, every
-/// unit reads the current input and its own state from sample `n - 1`; no
-/// lookahead or block accumulation is possible.
-///
-/// A trainer may use fewer than [`MAX_MODEL_UNITS`] by setting `unit_count`.
-/// Unused array entries are ignored.
-#[derive(Clone, Copy, Debug)]
-pub struct CompactCausalModel {
-    pub format_version: u32,
-    pub sample_rate_hz: u32,
-    pub causal: bool,
-    pub lookahead_samples: u32,
-    pub runtime_latency_samples: u32,
-    pub estimated_macs_per_sample: u32,
-    pub unit_count: u8,
-    pub dry_gain: f32,
-    pub output_bias: f32,
-    pub input_weights: [f32; MAX_MODEL_UNITS],
-    pub recurrent_weights: [f32; MAX_MODEL_UNITS],
-    pub biases: [f32; MAX_MODEL_UNITS],
-    pub output_weights: [f32; MAX_MODEL_UNITS],
-}
-
-impl Default for CompactCausalModel {
-    fn default() -> Self {
-        Self::raw()
-    }
-}
-
-impl CompactCausalModel {
-    /// Bit-exact identity model. It is also the processor's startup model.
-    #[must_use]
-    pub const fn raw() -> Self {
-        Self {
-            format_version: AMP_MODEL_FORMAT_VERSION,
-            sample_rate_hz: AMP_MODEL_SAMPLE_RATE_HZ,
-            causal: true,
-            lookahead_samples: 0,
-            runtime_latency_samples: 0,
-            estimated_macs_per_sample: 1,
-            unit_count: 0,
-            dry_gain: 1.0,
-            output_bias: 0.0,
-            input_weights: [0.0; MAX_MODEL_UNITS],
-            recurrent_weights: [0.0; MAX_MODEL_UNITS],
-            biases: [0.0; MAX_MODEL_UNITS],
-            output_weights: [0.0; MAX_MODEL_UNITS],
-        }
-    }
-
-    pub fn validate(&self) -> Result<(), AmpModelError> {
-        if self.format_version != AMP_MODEL_FORMAT_VERSION {
-            return Err(AmpModelError::UnsupportedFormatVersion(self.format_version));
-        }
-        if self.sample_rate_hz != AMP_MODEL_SAMPLE_RATE_HZ {
-            return Err(AmpModelError::UnsupportedSampleRate(self.sample_rate_hz));
-        }
-        if !self.causal || self.lookahead_samples != 0 || self.runtime_latency_samples != 0 {
-            return Err(AmpModelError::NonCausalOrLatent);
-        }
-        let unit_count = usize::from(self.unit_count);
-        if unit_count > MAX_MODEL_UNITS {
-            return Err(AmpModelError::TooManyUnits(self.unit_count));
-        }
-        if self.estimated_macs_per_sample > MAX_MODEL_MACS_PER_SAMPLE {
-            return Err(AmpModelError::ComputeBudgetExceeded(
-                self.estimated_macs_per_sample,
-            ));
-        }
-
-        let scalar_values = [self.dry_gain, self.output_bias];
-        if scalar_values.iter().any(|value| !value.is_finite())
-            || self.input_weights[..unit_count]
-                .iter()
-                .chain(&self.recurrent_weights[..unit_count])
-                .chain(&self.biases[..unit_count])
-                .chain(&self.output_weights[..unit_count])
-                .any(|value| !value.is_finite())
-        {
-            return Err(AmpModelError::NonFiniteCoefficient);
-        }
-        Ok(())
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AmpModelError {
-    UnsupportedFormatVersion(u32),
-    UnsupportedSampleRate(u32),
-    NonCausalOrLatent,
-    TooManyUnits(u8),
-    ComputeBudgetExceeded(u32),
-    NonFiniteCoefficient,
-    HostSampleRateMismatch { model: u32, host: u32 },
-}
-
-impl fmt::Display for AmpModelError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::UnsupportedFormatVersion(version) => {
-                write!(formatter, "unsupported amp model format version {version}")
-            }
-            Self::UnsupportedSampleRate(rate) => {
-                write!(formatter, "unsupported amp model sample rate {rate} Hz")
-            }
-            Self::NonCausalOrLatent => {
-                formatter.write_str("amp model must be causal with zero lookahead and latency")
-            }
-            Self::TooManyUnits(count) => write!(
-                formatter,
-                "amp model has {count} units; maximum is {MAX_MODEL_UNITS}"
-            ),
-            Self::ComputeBudgetExceeded(macs) => write!(
-                formatter,
-                "amp model requires {macs} MACs/sample; maximum is {MAX_MODEL_MACS_PER_SAMPLE}"
-            ),
-            Self::NonFiniteCoefficient => {
-                formatter.write_str("amp model contains a non-finite coefficient")
-            }
-            Self::HostSampleRateMismatch { model, host } => write!(
-                formatter,
-                "amp model is {model} Hz but the host is running at {host} Hz"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for AmpModelError {}
 
 #[derive(Clone, Copy, Debug)]
 struct SmoothedValue {
@@ -226,8 +90,7 @@ impl SmoothedValue {
 #[derive(Clone, Debug)]
 pub struct AmpProcessor {
     sample_rate: f32,
-    model: CompactCausalModel,
-    model_state: [f32; MAX_MODEL_UNITS],
+    a2: Option<A2Processor>,
     input_gain: SmoothedValue,
     tight: SmoothedValue,
     bite: SmoothedValue,
@@ -240,9 +103,8 @@ pub struct AmpProcessor {
 impl Default for AmpProcessor {
     fn default() -> Self {
         let mut processor = Self {
-            sample_rate: AMP_MODEL_SAMPLE_RATE_HZ as f32,
-            model: CompactCausalModel::raw(),
-            model_state: [0.0; MAX_MODEL_UNITS],
+            sample_rate: A2_SAMPLE_RATE_HZ as f32,
+            a2: None,
             input_gain: SmoothedValue::new(1.0),
             tight: SmoothedValue::new(0.0),
             bite: SmoothedValue::new(0.0),
@@ -262,7 +124,9 @@ impl AmpProcessor {
     /// ramp.
     pub fn reset(&mut self, config: &AudioConfig) {
         self.sample_rate = (config.sample_rate as f32).max(1.0);
-        self.model_state.fill(0.0);
+        if let Some(a2) = &mut self.a2 {
+            a2.reset();
+        }
         self.tight_low_state = 0.0;
         self.bite_low_state = 0.0;
         self.input_gain.current = self.input_gain.target;
@@ -281,32 +145,22 @@ impl AmpProcessor {
             1.0 - (-std::f32::consts::TAU * BITE_CORNER_HZ / self.sample_rate).exp();
     }
 
-    /// Installs a validated model and clears its recurrent state.
-    ///
-    /// Construct a replacement `AmpProcessor` on the loader thread when a
-    /// click-free whole-runtime swap is required.
-    pub fn load_model(&mut self, model: CompactCausalModel) -> Result<(), AmpModelError> {
-        model.validate()?;
+    /// Installs the exact fixed-shape NAM A2-C3 runtime used by captured
+    /// `.motmodel` files.
+    pub fn load_a2_model(&mut self, model: A2Model) -> Result<(), A2Error> {
         let host_rate = self.sample_rate.round() as u32;
-        if model.unit_count != 0 && model.sample_rate_hz != host_rate {
-            return Err(AmpModelError::HostSampleRateMismatch {
-                model: model.sample_rate_hz,
-                host: host_rate,
-            });
-        }
-        self.model = model;
-        self.model_state.fill(0.0);
+        let processor = A2Processor::new_for_sample_rate(model, host_rate)?;
+        self.a2 = Some(processor);
         Ok(())
     }
 
     pub fn unload_model(&mut self) {
-        self.model = CompactCausalModel::raw();
-        self.model_state.fill(0.0);
+        self.a2 = None;
     }
 
     #[must_use]
-    pub const fn model(&self) -> &CompactCausalModel {
-        &self.model
+    pub const fn has_model(&self) -> bool {
+        self.a2.is_some()
     }
 
     pub fn set_controls(&mut self, controls: AmpControls) {
@@ -349,19 +203,11 @@ impl AmpProcessor {
             flush_denormal(&mut self.tight_low_state);
             let tightened = gained - TIGHT_MAX_CUT * tight * self.tight_low_state;
 
-            let mut modeled = self.model.output_bias + self.model.dry_gain * tightened;
-            for unit in 0..usize::from(self.model.unit_count) {
-                let activation = self.model.input_weights[unit] * tightened
-                    + self.model.recurrent_weights[unit] * self.model_state[unit]
-                    + self.model.biases[unit];
-                let state = activation.tanh();
-                self.model_state[unit] = if state.abs() < DENORMAL_LIMIT {
-                    0.0
-                } else {
-                    state
-                };
-                modeled += self.model.output_weights[unit] * state;
-            }
+            let modeled = if let Some(a2) = &mut self.a2 {
+                a2.process_sample(tightened)
+            } else {
+                tightened
+            };
 
             self.bite_low_state += self.bite_low_coefficient * (modeled - self.bite_low_state);
             flush_denormal(&mut self.bite_low_state);
@@ -405,20 +251,17 @@ fn flush_denormal(value: &mut f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::a2::{A2_CHANNELS, A2_HEAD_KERNEL_SIZE, A2_HEAD_SCALE, A2_KERNEL_SIZES};
 
-    fn test_model() -> CompactCausalModel {
-        let mut model = CompactCausalModel::raw();
-        model.unit_count = 2;
-        model.dry_gain = 0.35;
-        model.input_weights[0] = 1.4;
-        model.input_weights[1] = -0.7;
-        model.recurrent_weights[0] = 0.62;
-        model.recurrent_weights[1] = -0.27;
-        model.biases[0] = 0.02;
-        model.biases[1] = -0.04;
-        model.output_weights[0] = 0.8;
-        model.output_weights[1] = -0.3;
-        model.estimated_macs_per_sample = 13;
+    /// A minimal valid A2 graph with a direct current-sample path. The public
+    /// arrays use tap-major runtime order.
+    fn current_sample_model() -> A2Model {
+        let mut model = A2Model::zeros();
+        model.weights.rechannel[0] = 1.0;
+        let layer_current_tap = A2_KERNEL_SIZES[0] - 1;
+        model.weights.layers[0].conv[layer_current_tap * A2_CHANNELS * A2_CHANNELS] = 1.0;
+        let head_current_tap = A2_HEAD_KERNEL_SIZE - 1;
+        model.weights.head[head_current_tap * A2_CHANNELS] = 1.0;
         model
     }
 
@@ -435,7 +278,7 @@ mod tests {
     }
 
     #[test]
-    fn recurrent_model_is_independent_of_host_block_partitioning() {
+    fn a2_model_is_independent_of_host_block_partitioning() {
         let config = AudioConfig::new(48_000.0, 512);
         let controls = AmpControls {
             input_gain_db: 3.2,
@@ -448,14 +291,14 @@ mod tests {
 
         let mut whole = AmpProcessor::default();
         whole.reset(&config);
-        whole.load_model(test_model()).unwrap();
+        whole.load_a2_model(current_sample_model()).unwrap();
         whole.set_controls_immediate(controls);
         let mut whole_output = vec![0.0; input.len()];
         whole.process_block(&input, &mut whole_output);
 
         let mut partitioned = AmpProcessor::default();
         partitioned.reset(&config);
-        partitioned.load_model(test_model()).unwrap();
+        partitioned.load_a2_model(current_sample_model()).unwrap();
         partitioned.set_controls_immediate(controls);
         let mut partitioned_output = vec![0.0; input.len()];
         let partitions = [1, 7, 32, 3, 64, 129, 5, 257];
@@ -475,7 +318,7 @@ mod tests {
     fn model_and_controls_preserve_sample_zero_onset() {
         let mut amp = AmpProcessor::default();
         amp.reset(&AudioConfig::new(48_000.0, 32));
-        amp.load_model(test_model()).unwrap();
+        amp.load_a2_model(current_sample_model()).unwrap();
         amp.set_controls_immediate(AmpControls {
             input_gain_db: 6.0,
             tight: 1.0,
@@ -485,6 +328,7 @@ mod tests {
         let mut output = [0.0; 4];
         amp.process_block(&input, &mut output);
         assert_ne!(output[0], 0.0);
+        assert!(output[0].is_sign_positive());
         assert_eq!(amp.latency_samples(), 0);
     }
 
@@ -514,28 +358,50 @@ mod tests {
     }
 
     #[test]
-    fn loader_rejects_non_causal_or_invalid_models() {
+    fn loader_rejects_invalid_or_wrong_rate_a2_models() {
         let mut amp = AmpProcessor::default();
         amp.reset(&AudioConfig::new(48_000.0, 32));
-        let mut model = test_model();
+        let mut model = current_sample_model();
         model.lookahead_samples = 1;
-        assert_eq!(amp.load_model(model), Err(AmpModelError::NonCausalOrLatent));
+        assert_eq!(amp.load_a2_model(model), Err(A2Error::NonCausalOrLatent));
 
-        let mut model = test_model();
-        model.input_weights[0] = f32::NAN;
-        assert_eq!(
-            amp.load_model(model),
-            Err(AmpModelError::NonFiniteCoefficient)
-        );
+        let mut model = current_sample_model();
+        model.weights.head[0] = f32::NAN;
+        assert_eq!(amp.load_a2_model(model), Err(A2Error::NonFiniteCoefficient));
 
-        let mut model = test_model();
-        model.estimated_macs_per_sample = MAX_MODEL_MACS_PER_SAMPLE + 1;
+        amp.reset(&AudioConfig::new(44_100.0, 32));
         assert_eq!(
-            amp.load_model(model),
-            Err(AmpModelError::ComputeBudgetExceeded(
-                MAX_MODEL_MACS_PER_SAMPLE + 1
-            ))
+            amp.load_a2_model(current_sample_model()),
+            Err(A2Error::HostSampleRateMismatch {
+                model: A2_SAMPLE_RATE_HZ,
+                host: 44_100,
+            })
         );
+    }
+
+    #[test]
+    fn unloading_a2_restores_bit_exact_raw_path() {
+        let mut amp = AmpProcessor::default();
+        amp.reset(&AudioConfig::new(48_000.0, 32));
+        amp.load_a2_model(current_sample_model()).unwrap();
+        assert!(amp.has_model());
+        amp.unload_model();
+        assert!(!amp.has_model());
+
+        let input = [-1.0, -0.25, 0.0, 0.125, 1.0];
+        let mut output = [f32::NAN; 5];
+        amp.process_block(&input, &mut output);
+        assert_eq!(output, input);
+    }
+
+    #[test]
+    fn direct_a2_model_has_expected_current_sample_gain() {
+        let mut amp = AmpProcessor::default();
+        amp.reset(&AudioConfig::new(48_000.0, 32));
+        amp.load_a2_model(current_sample_model()).unwrap();
+        let mut output = [0.0; 2];
+        amp.process_block(&[1.0, 0.0], &mut output);
+        assert_eq!(output[0].to_bits(), A2_HEAD_SCALE.to_bits());
     }
 
     #[cfg(feature = "rt-paranoid")]
@@ -543,7 +409,7 @@ mod tests {
     fn processing_allocates_nothing() {
         let mut amp = AmpProcessor::default();
         amp.reset(&AudioConfig::new(48_000.0, 32));
-        amp.load_model(test_model()).unwrap();
+        amp.load_a2_model(current_sample_model()).unwrap();
         amp.set_controls_immediate(AmpControls {
             input_gain_db: 2.0,
             tight: 0.4,

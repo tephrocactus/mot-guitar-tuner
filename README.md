@@ -50,7 +50,10 @@ capture routing, level checks, alignment, safety, and trainer behavior.
 
 ## Zero-latency architecture
 
-- Amp model: diagonal causal recurrent `tanh` network, maximum 32 units.
+- Amp model: official NAM WaveNet A2-C3 with 1,870
+  trainable parameters and 1,871 floats in the exported payload.
+- A2-C3 receptive field: 6,347 samples using only current and past input, with
+  zero lookahead and zero runtime latency.
 - Amp controls: causal/minimum-phase filters with per-sample smoothing.
 - Cabinet head: taps `0..63` evaluated directly.
 - Cabinet tail: non-uniform `64 / 256 / 1024` overlap-add stages.
@@ -63,6 +66,18 @@ capture routing, level checks, alignment, safety, and trainer behavior.
 
 RAW IR mode preserves the file's phase and any delay contained in the IR
 itself. That content delay is not reported as plug-in/PDC latency.
+
+## Trainer
+
+Training optimizes the official A2-C3 runtime directly with time-domain MSE.
+The user-selectable maximum is 1–400 full epochs and defaults to 400; every
+epoch traverses the complete training region. A contiguous held-out validation
+region is used for checkpoint selection, and the best validation checkpoint is
+retained.
+
+Publication has a hard quality gate: held-out validation ESR must be below
+`0.30`. An ESR of `0.30` or higher fails training and no model is published.
+MRSTFT loss or scoring is not implemented.
 
 ## Build
 
@@ -159,7 +174,7 @@ continuous cannot be identified reliably by the plug-in alone.
 
 ## Scope
 
-Version 0.3 is a private laboratory build. It does not provide physical dBu
+Version 0.4 is a private laboratory build. It does not provide physical dBu
 calibration, 44.1/96 kHz model playback, cross-process Capture IPC, stereo
 processing, or a high-latency/HQ mode. Commercial reference plug-ins, presets,
 third-party IRs, rendered captures, and trained model files are local assets

@@ -1,7 +1,7 @@
 # MOT Guitar Plugin capture lab
 
 This document describes the private two-instance capture workflow implemented
-for MOT Guitar Plugin 0.3. Capture is intentionally isolated from the normal
+for MOT Guitar Plugin 0.4. Capture is intentionally isolated from the normal
 amp/cab playback path: it may buffer minutes of audio and train on a worker,
 while NORMAL playback continues to report zero samples of plug-in latency.
 
@@ -102,8 +102,19 @@ correlation or training starts, the exact complete preallocated Return is
 written to `raw-return.wav`. The exact trimmed Source training input and
 aligned target are retained as `emitted.wav` and `aligned-return.wav`.
 
-The trainer supports 1–400 maximum passes, uses validation auto-stop, and
-exports the best checkpoint rather than the final checkpoint.
+The trainer fits the official causal NAM WaveNet A2-C3 architecture. It has
+1,870 trainable parameters; the exported payload contains 1,871 floats,
+including its fixed scale value. Its 6,347-sample receptive field is entirely
+historical/current context, so playback requires zero lookahead and adds zero
+runtime latency.
+
+The `MAX EPOCHS` control accepts 1–400 full epochs and defaults to 400. Each
+epoch traverses the complete training region. A contiguous held-out region
+supplies validation ESR and checkpoint selection, and the best validation
+checkpoint is retained. Publication has a hard quality gate: validation ESR
+must be below `0.30`; an ESR of `0.30` or higher fails training and no model is
+published. Training currently optimizes time-domain MSE. MRSTFT loss or scoring
+is not implemented.
 
 ## Software capture
 
@@ -120,6 +131,8 @@ Use only the chain intended to become the amp model. For an amp-only capture,
 disable cabinet, room, gate, pedals, modulation, delay, reverb, post EQ,
 limiter, normalization, and look-ahead processing. Keep every third-party
 setting and version fixed and record those details in the Capture form.
+`SEND TRIM` defaults to `0.0 dB` (unity) for software capture. Reduce it only
+when the routed chain needs additional headroom, then repeat `CHECK LEVEL`.
 
 The Return plug-in should be the first processor that receives the routed
 result. Its output is deliberately silent to reduce feedback risk.

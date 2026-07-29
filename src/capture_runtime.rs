@@ -17,17 +17,20 @@ use crossbeam_queue::ArrayQueue;
 use truce::prelude::BackgroundTask;
 
 use crate::MotStrobeParams;
+use crate::a2::encode_a2_payload;
+use crate::a2_train::{
+    A2CancellationToken, A2TrainerConfig, A2TrainingData, A2TrainingOutcome, A2TrainingStopReason,
+    train_a2,
+};
 use crate::capture::{
     AlignmentConfig, CAPTURE_SAMPLE_RATE_HZ, CaptureBinding, CaptureCoordinator, CaptureEngine,
     CaptureProgram, CaptureRole, CaptureSessionId, CaptureTarget, CompletedReturn,
     HardwareCaptureMetadata, extract_aligned_excitation, measure_alignment,
 };
-use crate::model::{ModelMetadata, ModelRef, MotModel, sha256};
-use crate::model_library::ModelLibrary;
-use crate::trainer::{
-    CancellationToken, TrainerConfig, TrainingData, TrainingStopReason, encode_model_payload,
-    model_descriptor, train_compact_model,
+use crate::model::{
+    A2_ARCHITECTURE_ID, A2_ARCHITECTURE_VERSION, ModelMetadata, ModelRef, MotModel, sha256,
 };
+use crate::model_library::ModelLibrary;
 #[cfg(test)]
 use crate::wav_io::read_mono_wav;
 use crate::wav_io::{decode_mono_wav, write_mono_f32_wav};
@@ -104,7 +107,6 @@ impl PreparedCaptureRuntime {
 }
 
 /// Shared lock-free handoff owned by one plugin instance.
-#[derive(Debug)]
 pub struct CaptureControl {
     ready: ArrayQueue<Box<PreparedCaptureRuntime>>,
     retired: ArrayQueue<Box<PreparedCaptureRuntime>>,
@@ -113,7 +115,7 @@ pub struct CaptureControl {
     progress_bits: AtomicU32,
     last_error: RwLock<String>,
     last_saved_model: RwLock<Option<ModelRef>>,
-    cancellation: CancellationToken,
+    cancellation: A2CancellationToken,
 }
 
 impl Default for CaptureControl {
@@ -126,7 +128,7 @@ impl Default for CaptureControl {
             progress_bits: AtomicU32::new(0.0_f32.to_bits()),
             last_error: RwLock::new(String::new()),
             last_saved_model: RwLock::new(None),
-            cancellation: CancellationToken::default(),
+            cancellation: A2CancellationToken::default(),
         }
     }
 }
@@ -308,7 +310,9 @@ impl BackgroundTask for StartTrainingTask {
 
     fn run(self, params: &Self::Params) {
         let control = Arc::clone(&params.capture_control);
-        let max_passes = params.max_passes.value_i32().clamp(1, 400) as u16;
+        // The persisted parameter name remains `max_passes`, but one unit is
+        // now one complete A2 dataset epoch rather than one optimizer update.
+        let max_epochs = params.max_passes.value_i32().clamp(1, 400) as u32;
         let display_name = params
             .capture_model_name
             .read()
@@ -339,7 +343,7 @@ impl BackgroundTask for StartTrainingTask {
                 self.completed,
                 self.program,
                 self.source_send_trim_db,
-                max_passes,
+                max_epochs,
                 &display_name,
                 capture_metadata,
             );
@@ -357,7 +361,7 @@ fn run_training_job(
     completed: CompletedReturn,
     program: Arc<CaptureProgram>,
     source_send_trim_db: f32,
-    max_passes: u16,
+    max_epochs: u32,
     display_name: &str,
     mut capture_metadata: HardwareCaptureMetadata,
 ) {
@@ -388,49 +392,6 @@ fn run_training_job(
         write_mono_f32_wav(&capture_dir.join("aligned-return.wav"), 48_000, &target)
             .map_err(|error| error.to_string())?;
 
-        control.set_status(CaptureWorkerStatus::Training);
-        let config = TrainerConfig {
-            max_passes,
-            ..TrainerConfig::default()
-        };
-        let outcome = train_compact_model(
-            TrainingData {
-                input: &emitted,
-                target: &target,
-                sample_rate_hz: 48_000,
-            },
-            config,
-            &control.cancellation,
-            |progress| {
-                control.set_progress(
-                    f32::from(progress.completed_passes)
-                        / f32::from(progress.maximum_passes.max(1)),
-                );
-            },
-        )
-        .map_err(|error| error.to_string())?;
-        if outcome.stop_reason == TrainingStopReason::Cancelled {
-            return Ok(None);
-        }
-        let descriptor = model_descriptor(&outcome.best_model);
-        let metadata = ModelMetadata {
-            model_id: model_id.clone(),
-            display_name: normalized_display_name(display_name, &model_id),
-            architecture_id: descriptor.architecture_id.to_owned(),
-            architecture_version: descriptor.architecture_version,
-            sample_rate_hz: descriptor.sample_rate_hz,
-            causal: descriptor.causal,
-            lookahead_samples: descriptor.lookahead_samples,
-            runtime_latency_samples: descriptor.runtime_latency_samples,
-            estimated_macs_per_sample: u64::from(descriptor.estimated_macs_per_sample),
-        };
-        let model = MotModel::new(metadata, encode_model_payload(&outcome.best_model))
-            .map_err(|error| error.to_string())?;
-        let filename = format!("{model_id}.motmodel");
-        model
-            .write_new(paths.models.join(&filename))
-            .map_err(|error| error.to_string())?;
-
         capture_metadata.source_send_trim_db = source_send_trim_db;
         capture_metadata.measured_latency_samples = Some(alignment.fractional_latency_samples);
         capture_metadata.return_peak_dbfs =
@@ -442,19 +403,71 @@ fn run_training_job(
         }
         capture_metadata.excitation_hash = sha256(&excitation_bytes).to_string();
 
+        control.set_status(CaptureWorkerStatus::Training);
+        let config = A2TrainerConfig {
+            max_epochs,
+            ..A2TrainerConfig::default()
+        };
+        let outcome = match train_a2(
+            A2TrainingData {
+                input: &emitted,
+                target: &target,
+                sample_rate_hz: 48_000,
+            },
+            config,
+            &control.cancellation,
+            |progress| {
+                control.set_progress(
+                    progress.completed_epochs as f32 / progress.maximum_epochs.max(1) as f32,
+                );
+            },
+        ) {
+            Ok(outcome) => outcome,
+            Err(_error) if control.cancellation.is_cancelled() => return Ok(None),
+            Err(error) => return Err(error.to_string()),
+        };
+
         let metadata_json = capture_record_json(
             &model_id,
             timestamp,
             alignment.integer_latency_samples,
             alignment.normalized_correlation,
-            outcome.completed_passes,
-            outcome.best_pass,
-            outcome.best_validation_loss,
-            outcome.stop_reason,
+            &outcome,
             &capture_metadata,
         );
         fs::write(capture_dir.join("capture.json"), metadata_json)
             .map_err(|error| error.to_string())?;
+
+        if outcome.stop_reason == A2TrainingStopReason::Cancelled {
+            return Ok(None);
+        }
+        if outcome.quality.validation_esr >= 0.30 || !outcome.quality.passes_publication_gate {
+            return Err(format!(
+                "A2 model rejected: best validation ESR {:.6} ({:.2} dB) does not pass the 0.30 publication gate; capture WAVs were preserved in {}",
+                outcome.quality.validation_esr,
+                outcome.quality.validation_esr_db,
+                capture_dir.display()
+            ));
+        }
+
+        let metadata = ModelMetadata {
+            model_id: model_id.clone(),
+            display_name: normalized_display_name(display_name, &model_id),
+            architecture_id: A2_ARCHITECTURE_ID.to_owned(),
+            architecture_version: A2_ARCHITECTURE_VERSION,
+            sample_rate_hz: outcome.model.sample_rate_hz,
+            causal: outcome.model.causal,
+            lookahead_samples: outcome.model.lookahead_samples,
+            runtime_latency_samples: outcome.model.runtime_latency_samples,
+            estimated_macs_per_sample: u64::from(outcome.model.estimated_macs_per_sample),
+        };
+        let payload = encode_a2_payload(&outcome.model).map_err(|error| error.to_string())?;
+        let model = MotModel::new(metadata, payload).map_err(|error| error.to_string())?;
+        let filename = format!("{model_id}.motmodel");
+        model
+            .write_new(paths.models.join(&filename))
+            .map_err(|error| error.to_string())?;
+
         Ok(Some(model.model_ref(filename)))
     })();
 
@@ -588,20 +601,17 @@ fn capture_record_json(
     timestamp: u64,
     integer_latency_samples: i64,
     correlation: f64,
-    completed_passes: u16,
-    best_pass: u16,
-    best_validation_loss: f64,
-    stop_reason: TrainingStopReason,
+    outcome: &A2TrainingOutcome,
     metadata: &HardwareCaptureMetadata,
 ) -> String {
     let target_name = match metadata.target {
         CaptureTarget::SoftwarePluginChain => "software_plugin_chain",
         CaptureTarget::FullAmpUnfilteredLoad => "full_amp_unfiltered_load",
     };
-    let stop_reason_name = match stop_reason {
-        TrainingStopReason::MaximumPasses => "maximum_passes",
-        TrainingStopReason::EarlyStopping => "early_stopping",
-        TrainingStopReason::Cancelled => "cancelled",
+    let stop_reason_name = match outcome.stop_reason {
+        A2TrainingStopReason::MaximumEpochs => "maximum_epochs",
+        A2TrainingStopReason::ThresholdReached => "threshold_reached",
+        A2TrainingStopReason::Cancelled => "cancelled",
     };
     let load_impedance = metadata
         .load_impedance_ohms
@@ -609,7 +619,7 @@ fn capture_record_json(
     format!(
         concat!(
             "{{\n",
-            "  \"schema_version\": 1,\n",
+            "  \"schema_version\": 2,\n",
             "  \"model_id\": \"{}\",\n",
             "  \"created_unix_seconds\": {},\n",
             "  \"target\": \"{}\",\n",
@@ -626,9 +636,14 @@ fn capture_record_json(
             "  \"return_peak_dbfs\": {:.3},\n",
             "  \"return_rms_dbfs\": {:.3},\n",
             "  \"excitation_sha256\": \"{}\",\n",
-            "  \"completed_passes\": {},\n",
-            "  \"best_pass\": {},\n",
-            "  \"best_validation_loss\": {:.12},\n",
+            "  \"completed_epochs\": {},\n",
+            "  \"best_epoch\": {},\n",
+            "  \"best_validation_esr\": {:.12},\n",
+            "  \"best_validation_esr_db\": {:.6},\n",
+            "  \"output_normalization_gain\": {:.12},\n",
+            "  \"original_train_target_rms_dbfs\": {:.6},\n",
+            "  \"training_elapsed_seconds\": {:.6},\n",
+            "  \"publication_gate_passed\": {},\n",
             "  \"training_stop_reason\": \"{}\",\n",
             "  \"amplifier\": \"{}\",\n",
             "  \"amplifier_channel\": \"{}\",\n",
@@ -651,9 +666,14 @@ fn capture_record_json(
         metadata.return_peak_dbfs.unwrap_or(f32::NEG_INFINITY),
         metadata.return_rms_dbfs.unwrap_or(f32::NEG_INFINITY),
         metadata.excitation_hash,
-        completed_passes,
-        best_pass,
-        best_validation_loss,
+        outcome.completed_epochs,
+        outcome.best_epoch,
+        outcome.quality.validation_esr,
+        outcome.quality.validation_esr_db,
+        outcome.quality.output_normalization_gain,
+        outcome.quality.original_train_target_rms_dbfs,
+        outcome.elapsed_seconds,
+        outcome.quality.passes_publication_gate,
         stop_reason_name,
         escape_json(&metadata.amplifier),
         escape_json(&metadata.amplifier_channel),
@@ -774,18 +794,25 @@ mod tests {
         metadata.load_impedance_ohms = Some(8);
         metadata.return_gain_note = "0 dB, pad off".to_owned();
 
-        let json = capture_record_json(
-            "capture-test",
-            123,
-            137,
-            0.94,
-            400,
-            287,
-            0.000_123,
-            TrainingStopReason::EarlyStopping,
-            &metadata,
-        );
+        let outcome = A2TrainingOutcome {
+            model: crate::a2::A2Model::zeros(),
+            completed_epochs: 400,
+            best_epoch: 287,
+            stop_reason: A2TrainingStopReason::MaximumEpochs,
+            quality: crate::a2_train::A2QualityReport {
+                validation_esr: 0.0123,
+                validation_esr_db: -19.096_910_013,
+                quality: crate::a2_train::A2PublicationQuality::NotBad,
+                passes_publication_gate: true,
+                original_train_target_rms_dbfs: -18.7,
+                output_normalization_gain: 1.087,
+                mrstft_weight_applied: 0.0,
+            },
+            elapsed_seconds: 913.25,
+        };
+        let json = capture_record_json("capture-test", 123, 137, 0.94, &outcome, &metadata);
 
+        assert!(json.contains("\"schema_version\": 2"));
         assert!(json.contains("\"target\": \"full_amp_unfiltered_load\""));
         assert!(json.contains("\"status\": \"uncalibrated\""));
         assert!(json.contains("\"input_level_dbu\": null"));
@@ -794,6 +821,121 @@ mod tests {
         assert!(json.contains("\"amplifier\": \"EVH 5153 \\\"Blue\\\"\""));
         assert!(json.contains("\"load_impedance_ohms\": 8"));
         assert!(json.contains("\"return_gain_note\": \"0 dB, pad off\""));
-        assert!(json.contains("\"training_stop_reason\": \"early_stopping\""));
+        assert!(json.contains("\"completed_epochs\": 400"));
+        assert!(json.contains("\"best_epoch\": 287"));
+        assert!(json.contains("\"best_validation_esr\": 0.012300000000"));
+        assert!(json.contains("\"best_validation_esr_db\": -19.096910"));
+        assert!(json.contains("\"output_normalization_gain\": 1.087000000000"));
+        assert!(json.contains("\"training_elapsed_seconds\": 913.250000"));
+        assert!(json.contains("\"publication_gate_passed\": true"));
+        assert!(json.contains("\"training_stop_reason\": \"maximum_epochs\""));
+        assert!(!json.contains("completed_passes"));
+        assert!(!json.contains("best_validation_loss"));
+    }
+
+    /// Developer-only recovery path for a valid capture whose legacy trainer
+    /// produced an unusable model. This test is deliberately ignored and
+    /// requires an explicit capture directory:
+    ///
+    /// `MOT_CAPTURE_DIR=/.../Capture Records/capture-... cargo test
+    ///  retrain_existing_capture_as_a2 -- --ignored --nocapture`
+    #[test]
+    #[ignore = "requires MOT_CAPTURE_DIR and performs a long full-dataset A2 training run"]
+    fn retrain_existing_capture_as_a2() {
+        let capture_dir = std::env::var_os("MOT_CAPTURE_DIR")
+            .map(PathBuf::from)
+            .expect("set MOT_CAPTURE_DIR to an existing Capture Records directory");
+        let emitted = read_mono_wav(&capture_dir.join("emitted.wav"))
+            .expect("read emitted.wav from MOT_CAPTURE_DIR");
+        let target = read_mono_wav(&capture_dir.join("aligned-return.wav"))
+            .expect("read aligned-return.wav from MOT_CAPTURE_DIR");
+        assert_eq!(emitted.sample_rate, 48_000, "emitted.wav must be 48 kHz");
+        assert_eq!(
+            target.sample_rate, 48_000,
+            "aligned-return.wav must be 48 kHz"
+        );
+        assert_eq!(
+            emitted.samples.len(),
+            target.samples.len(),
+            "capture WAV lengths must match"
+        );
+
+        let max_epochs = std::env::var("MOT_MAX_EPOCHS")
+            .ok()
+            .map(|value| value.parse::<u32>().expect("MOT_MAX_EPOCHS must be u32"))
+            .unwrap_or(400)
+            .clamp(1, 400);
+        let cancellation = A2CancellationToken::default();
+        let outcome = train_a2(
+            A2TrainingData {
+                input: &emitted.samples,
+                target: &target.samples,
+                sample_rate_hz: emitted.sample_rate,
+            },
+            A2TrainerConfig {
+                max_epochs,
+                ..A2TrainerConfig::default()
+            },
+            &cancellation,
+            |progress| {
+                eprintln!(
+                    "A2 epoch {}/{}: validation ESR {:.6} (best {:.6} @ {}), {:.1}s elapsed",
+                    progress.completed_epochs,
+                    progress.maximum_epochs,
+                    progress.validation_esr,
+                    progress.best_validation_esr,
+                    progress.best_epoch,
+                    progress.elapsed_seconds
+                );
+            },
+        )
+        .expect("train existing capture");
+
+        assert_ne!(
+            outcome.stop_reason,
+            A2TrainingStopReason::Cancelled,
+            "developer retraining was cancelled"
+        );
+        assert!(
+            outcome.quality.passes_publication_gate && outcome.quality.validation_esr < 0.30,
+            "A2 model failed publication gate: ESR {:.6}",
+            outcome.quality.validation_esr
+        );
+
+        let library = ModelLibrary::for_current_user().expect("locate model library");
+        library.ensure_directories().expect("create model library");
+        let generation = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos() as u64;
+        let (model_id, _) = unique_model_id(0, generation);
+        let source_name = capture_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("capture");
+        let metadata = ModelMetadata {
+            model_id: model_id.clone(),
+            display_name: format!("A2 retrain {source_name}"),
+            architecture_id: A2_ARCHITECTURE_ID.to_owned(),
+            architecture_version: A2_ARCHITECTURE_VERSION,
+            sample_rate_hz: outcome.model.sample_rate_hz,
+            causal: outcome.model.causal,
+            lookahead_samples: outcome.model.lookahead_samples,
+            runtime_latency_samples: outcome.model.runtime_latency_samples,
+            estimated_macs_per_sample: u64::from(outcome.model.estimated_macs_per_sample),
+        };
+        let payload = encode_a2_payload(&outcome.model).expect("encode A2 payload");
+        let model = MotModel::new(metadata, payload).expect("construct immutable A2 model");
+        let filename = format!("{model_id}.motmodel");
+        let destination = library.paths().models.join(&filename);
+        model
+            .write_new(&destination)
+            .expect("publish immutable A2 model");
+        eprintln!(
+            "published {} (best ESR {:.6}, epoch {})",
+            destination.display(),
+            outcome.quality.validation_esr,
+            outcome.best_epoch
+        );
     }
 }

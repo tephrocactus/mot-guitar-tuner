@@ -26,8 +26,14 @@ use std::{ffi::c_int, ffi::c_long};
 
 use truce::prelude::AudioConfig;
 
-use crate::amp::{CompactCausalModel, MAX_MODEL_UNITS};
-use crate::model::{ModelMetadata, ModelRef, MotModel, REQUIRED_SAMPLE_RATE_HZ, sha256};
+use crate::a2::{
+    A2_CHANNELS, A2_HEAD_KERNEL_SIZE, A2_HEAD_SCALE, A2_KERNEL_SIZES, A2_MACS_PER_SAMPLE, A2Model,
+    encode_a2_payload,
+};
+use crate::model::{
+    A2_ARCHITECTURE_ID, A2_ARCHITECTURE_VERSION, ModelMetadata, ModelRef, MotModel,
+    REQUIRED_SAMPLE_RATE_HZ, sha256,
+};
 use crate::model_library::{
     IrProcessingMode, IrReference, ModelLibrary, ModelLibraryPaths, TONE_SETTINGS_VERSION,
     ToneSettings,
@@ -37,7 +43,6 @@ use crate::runtime::{
     RuntimeUpdate,
 };
 use crate::signal_chain::{GuitarSignalChain, RuntimeApplyStatus};
-use crate::trainer::{encode_model_payload, model_descriptor};
 use crate::wav_io::write_mono_f32_wav;
 
 const TARGET_BLOCK_SIZE: usize = 32;
@@ -125,18 +130,81 @@ impl Drop for TestDirectory {
     }
 }
 
-fn maximum_tracking_model() -> CompactCausalModel {
-    let mut model = CompactCausalModel::raw();
-    model.unit_count = MAX_MODEL_UNITS as u8;
-    model.dry_gain = 0.25;
-    model.estimated_macs_per_sample = 3 + u32::from(model.unit_count) * 7;
-    for unit in 0..MAX_MODEL_UNITS {
-        let phase = (unit + 1) as f32 / MAX_MODEL_UNITS as f32;
-        model.input_weights[unit] = 0.15 + 0.85 * phase;
-        model.recurrent_weights[unit] = 0.15 + 0.45 * (phase * 2.73).sin().abs();
-        model.output_weights[unit] = (phase * 7.31).sin() * 0.025;
+fn maximum_tracking_model() -> A2Model {
+    let mut model = A2Model::zeros();
+    model.weights.rechannel = [0.20, -0.20, 0.000_1];
+
+    for (layer_index, layer) in model.weights.layers.iter_mut().enumerate() {
+        let active_conv_weights = A2_KERNEL_SIZES[layer_index] * A2_CHANNELS * A2_CHANNELS;
+        for (coefficient_index, coefficient) in
+            layer.conv.iter_mut().take(active_conv_weights).enumerate()
+        {
+            let magnitude =
+                0.000_001 + 0.000_001 * ((coefficient_index + layer_index * 3) % 7) as f32;
+            *coefficient = if (coefficient_index + layer_index) % 2 == 0 {
+                magnitude
+            } else {
+                -magnitude
+            };
+        }
+
+        let layer_scale = 0.92 + layer_index as f32 * 0.004;
+        layer.input_mixin = [
+            0.20 * layer_scale,
+            -0.20 * layer_scale,
+            0.000_1 * layer_scale,
+        ];
+        for (coefficient_index, coefficient) in layer.residual.iter_mut().enumerate() {
+            let input_channel = coefficient_index / A2_CHANNELS;
+            let output_channel = coefficient_index % A2_CHANNELS;
+            *coefficient = if input_channel == output_channel {
+                0.000_03
+            } else if (input_channel + output_channel + layer_index) % 2 == 0 {
+                0.000_01
+            } else {
+                -0.000_01
+            };
+        }
     }
+
+    populate_acceptance_head(&mut model);
+
+    // The final three coefficients are the current-sample head taps. Keep
+    // them strong enough to make sample-zero processing observable while all
+    // preceding taps remain populated for the maximum A2 runtime exercise.
     model.validate().expect("maximum model must be valid");
+    model
+}
+
+fn populate_acceptance_head(model: &mut A2Model) {
+    for tap in 0..A2_HEAD_KERNEL_SIZE {
+        let offset = tap * A2_CHANNELS;
+        let magnitude = 0.001_5 + 0.000_25 * (tap % 5) as f32;
+        model.weights.head[offset] = magnitude;
+        model.weights.head[offset + 1] = -magnitude;
+        model.weights.head[offset + 2] = 0.000_01 * (tap + 1) as f32;
+    }
+    let current_head_tap = (A2_HEAD_KERNEL_SIZE - 1) * A2_CHANNELS;
+    model.weights.head[current_head_tap..current_head_tap + A2_CHANNELS]
+        .copy_from_slice(&[0.12, -0.12, 0.000_16]);
+    // Assign this explicitly so the payload round-trip exercises the
+    // serialized head-scale field instead of relying on its default.
+    model.weights.head_scale = A2_HEAD_SCALE;
+}
+
+fn linear_reference_model() -> A2Model {
+    let mut model = A2Model::zeros();
+    for (layer_index, layer) in model.weights.layers.iter_mut().enumerate() {
+        // LeakyReLU(x) - LeakyReLU(-x) is exactly linear. Using a channel
+        // pair preserves a deterministic linear baseline for the nonlinear
+        // aliasing proxy while exercising the same fixed A2 runtime shape.
+        let layer_scale = 0.92 + layer_index as f32 * 0.004;
+        layer.input_mixin = [0.20 * layer_scale, -0.20 * layer_scale, 0.0];
+    }
+    populate_acceptance_head(&mut model);
+    model
+        .validate()
+        .expect("linear A2 reference model must be valid");
     model
 }
 
@@ -151,18 +219,20 @@ fn maximum_raw_ir() -> Vec<f32> {
     ir
 }
 
-fn metadata_for(model: &CompactCausalModel, model_id: &str) -> ModelMetadata {
-    let descriptor = model_descriptor(model);
+fn metadata_for(model: &A2Model, model_id: &str) -> ModelMetadata {
+    model
+        .validate()
+        .expect("acceptance metadata requires a valid A2 model");
     ModelMetadata {
         model_id: model_id.to_owned(),
         display_name: format!("Acceptance {model_id}"),
-        architecture_id: descriptor.architecture_id.to_owned(),
-        architecture_version: descriptor.architecture_version,
-        sample_rate_hz: descriptor.sample_rate_hz,
-        causal: descriptor.causal,
-        lookahead_samples: descriptor.lookahead_samples,
-        runtime_latency_samples: descriptor.runtime_latency_samples,
-        estimated_macs_per_sample: u64::from(descriptor.estimated_macs_per_sample),
+        architecture_id: A2_ARCHITECTURE_ID.to_owned(),
+        architecture_version: A2_ARCHITECTURE_VERSION,
+        sample_rate_hz: model.sample_rate_hz,
+        causal: model.causal,
+        lookahead_samples: model.lookahead_samples,
+        runtime_latency_samples: model.runtime_latency_samples,
+        estimated_macs_per_sample: u64::from(A2_MACS_PER_SAMPLE),
     }
 }
 
@@ -186,16 +256,10 @@ fn build_maximum_runtime() -> PreparedRuntime {
 }
 
 fn build_linear_reference_runtime() -> PreparedRuntime {
-    let mut model = maximum_tracking_model();
-    model.unit_count = 0;
-    model.estimated_macs_per_sample = 3;
-    model
-        .validate()
-        .expect("linear reference model must be valid");
-    build_acceptance_runtime(model, "linear-reference")
+    build_acceptance_runtime(linear_reference_model(), "linear-reference")
 }
 
-fn build_acceptance_runtime(model: CompactCausalModel, model_id: &str) -> PreparedRuntime {
+fn build_acceptance_runtime(model: A2Model, model_id: &str) -> PreparedRuntime {
     let directory = TestDirectory::new();
     let library = ModelLibrary::new(ModelLibraryPaths::from_plugin_root(
         directory.0.join("library"),
@@ -204,8 +268,11 @@ fn build_acceptance_runtime(model: CompactCausalModel, model_id: &str) -> Prepar
         .ensure_directories()
         .expect("create acceptance model library");
 
-    let container = MotModel::new(metadata_for(&model, model_id), encode_model_payload(&model))
-        .expect("model container");
+    let container = MotModel::new(
+        metadata_for(&model, model_id),
+        encode_a2_payload(&model).expect("encode acceptance A2 payload"),
+    )
+    .expect("model container");
     let model_filename = format!("acceptance-{model_id}.motmodel");
     container
         .write_new(library.paths().models.join(&model_filename))

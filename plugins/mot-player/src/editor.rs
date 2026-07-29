@@ -1,5 +1,9 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, TryRecvError};
+use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::Duration;
 
 use egui::{Align, Color32, FontId, Layout, RichText, Vec2};
@@ -17,9 +21,9 @@ use mot_ui::{
 };
 
 use crate::{
-    ImportIrTask, ImportNamTask, IrImportOutcome, LibraryOutcome, LibraryTask,
-    LibraryTaskOperation, MotPlayerParams, P, RuntimeUiState, read_shared_string,
-    write_shared_string,
+    ExternalFilePickerKind, ImportIrTask, IrImportOutcome, LibraryOutcome, LibraryTask,
+    LibraryTaskOperation, MotPlayerParams, P, RuntimeUiState, parse_external_file_picker_output,
+    read_shared_string, spawn_external_file_picker, write_shared_string,
 };
 
 pub(crate) const WINDOW_SIZE: (u32, u32) = (1_180, 760);
@@ -76,6 +80,33 @@ impl ToneView {
     }
 }
 
+struct RunningExternalFilePicker {
+    kind: ExternalFilePickerKind,
+    cancel: Arc<AtomicBool>,
+    result: Mutex<mpsc::Receiver<Result<Option<PathBuf>, String>>>,
+}
+
+impl std::fmt::Debug for RunningExternalFilePicker {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RunningExternalFilePicker")
+            .field("kind", &self.kind)
+            .finish()
+    }
+}
+
+impl Drop for RunningExternalFilePicker {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Release);
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PendingFileSelection {
+    kind: ExternalFilePickerKind,
+    path: PathBuf,
+}
+
 #[derive(Clone, Debug, Default)]
 struct EditorState {
     initialized: bool,
@@ -90,6 +121,8 @@ struct EditorState {
     switch_after_save: bool,
     message: Option<String>,
     message_after_refresh: Option<String>,
+    external_file_picker: Option<Arc<RunningExternalFilePicker>>,
+    pending_file_selection: Option<PendingFileSelection>,
 }
 
 pub(crate) struct MotPlayerUi;
@@ -105,8 +138,10 @@ impl EditorUi<MotPlayerParams> for MotPlayerUi {
         if !state.initialized {
             initialize_editor_state(&mut state, context);
         }
+        poll_external_file_picker(&mut state);
         poll_library_outcomes(&mut state, context);
         poll_ir_import_outcome(&mut state, context);
+        service_pending_file_selection(&mut state, context);
         service_pending_library_refresh(&mut state, context);
         service_pending_auto_selection(&mut state, context);
 
@@ -216,48 +251,139 @@ fn submit_library_task(
     Ok(())
 }
 
-fn submit_nam_import_picker(context: &PluginContext<MotPlayerParams>) -> Result<(), String> {
-    let Some(spawner) = context.tasks::<ImportNamTask>() else {
-        return Err("NAM import worker is unavailable in this host".to_owned());
-    };
-    let request_id = context
-        .library_control
-        .try_begin()
-        .ok_or_else(|| "A model-library operation is already running".to_owned())?;
-    let picker = Box::pin(
-        rfd::AsyncFileDialog::new()
-            .add_filter("Neural Amp Modeler", &["nam", "NAM"])
-            .set_title("Import NAM Model")
-            .pick_file(),
-    );
-    if spawner
-        .try_spawn(ImportNamTask { request_id, picker })
-        .is_err()
-    {
-        context.library_control.cancel_begin(request_id);
-        return Err("NAM import worker queue is full".to_owned());
-    }
-    Ok(())
-}
-
-fn submit_ir_import_picker(context: &PluginContext<MotPlayerParams>) -> Result<(), String> {
+fn submit_ir_import(
+    context: &PluginContext<MotPlayerParams>,
+    source: PathBuf,
+) -> Result<(), String> {
     let Some(spawner) = context.tasks::<ImportIrTask>() else {
         return Err("IR import worker is unavailable in this host".to_owned());
     };
     if !context.ir_import_control.try_begin() {
         return Err("An IR import is already running".to_owned());
     }
-    let picker = Box::pin(
-        rfd::AsyncFileDialog::new()
-            .add_filter("WAV audio", &["wav", "WAV"])
-            .set_title("Import Cabinet IR")
-            .pick_file(),
-    );
-    if spawner.try_spawn(ImportIrTask { picker }).is_err() {
+    if spawner.try_spawn(ImportIrTask { source }).is_err() {
         context.ir_import_control.cancel_begin();
         return Err("IR import worker queue is full".to_owned());
     }
     Ok(())
+}
+
+fn begin_external_file_picker(
+    state: &mut EditorState,
+    kind: ExternalFilePickerKind,
+) -> Result<(), String> {
+    if state.external_file_picker.is_some() || state.pending_file_selection.is_some() {
+        return Err("A file picker is already open".to_owned());
+    }
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let cancel = Arc::new(AtomicBool::new(false));
+    let worker_cancel = Arc::clone(&cancel);
+    thread::Builder::new()
+        .name("mot-file-picker".to_owned())
+        .spawn(move || {
+            let result = run_external_file_picker_worker(kind, &worker_cancel);
+            let _ = sender.send(result);
+        })
+        .map_err(|error| format!("cannot start isolated file picker worker: {error}"))?;
+    state.external_file_picker = Some(Arc::new(RunningExternalFilePicker {
+        kind,
+        cancel,
+        result: Mutex::new(receiver),
+    }));
+    Ok(())
+}
+
+fn run_external_file_picker_worker(
+    kind: ExternalFilePickerKind,
+    cancel: &AtomicBool,
+) -> Result<Option<PathBuf>, String> {
+    let mut child = spawn_external_file_picker(kind)?;
+    loop {
+        if cancel.load(Ordering::Acquire) {
+            let _ = child.kill();
+        }
+        match child.try_wait() {
+            Ok(None) => thread::sleep(Duration::from_millis(16)),
+            Ok(Some(_)) => {
+                return child
+                    .wait_with_output()
+                    .map_err(|error| format!("cannot read isolated file picker result: {error}"))
+                    .and_then(|output| {
+                        parse_external_file_picker_output(
+                            output.status.success(),
+                            &output.stdout,
+                            &output.stderr,
+                        )
+                    });
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("cannot poll isolated file picker: {error}"));
+            }
+        }
+    }
+}
+
+fn poll_external_file_picker(state: &mut EditorState) {
+    let Some(shared_picker) = state.external_file_picker.clone() else {
+        return;
+    };
+    let kind = shared_picker.kind;
+    let completed = match shared_picker.result.lock() {
+        Ok(receiver) => match receiver.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => {
+                Err("Isolated file picker worker stopped unexpectedly".to_owned())
+            }
+        },
+        Err(_) => {
+            state.external_file_picker = None;
+            state.message = Some("Isolated file picker state is unavailable".to_owned());
+            return;
+        }
+    };
+
+    state.external_file_picker = None;
+    match completed {
+        Ok(None) => state.message = None,
+        Ok(Some(path)) => {
+            state.pending_file_selection = Some(PendingFileSelection { kind, path });
+        }
+        Err(error) => state.message = Some(error),
+    }
+}
+
+fn service_pending_file_selection(
+    state: &mut EditorState,
+    context: &PluginContext<MotPlayerParams>,
+) {
+    let Some(selection) = state.pending_file_selection.clone() else {
+        return;
+    };
+    let result = match selection.kind {
+        ExternalFilePickerKind::NamModel if context.library_control.is_busy() => return,
+        ExternalFilePickerKind::NamModel => submit_library_task(
+            context,
+            LibraryTaskOperation::ImportNam {
+                source: selection.path,
+            },
+        )
+        .map(|()| "Validating and converting the NAM model…".to_owned()),
+        ExternalFilePickerKind::CabinetIr if context.ir_import_control.is_busy() => return,
+        ExternalFilePickerKind::CabinetIr => submit_ir_import(context, selection.path)
+            .map(|()| "Importing the cabinet IR…".to_owned()),
+    };
+    state.pending_file_selection = None;
+    match result {
+        Ok(message) => state.message = Some(message),
+        Err(error) => state.message = Some(error),
+    }
+}
+
+fn file_picker_is_busy(state: &EditorState) -> bool {
+    state.external_file_picker.is_some() || state.pending_file_selection.is_some()
 }
 
 fn poll_library_outcomes(state: &mut EditorState, context: &PluginContext<MotPlayerParams>) {
@@ -286,7 +412,6 @@ fn poll_library_outcomes(state: &mut EditorState, context: &PluginContext<MotPla
             LibraryOutcome::NamImported { result, .. } => {
                 apply_nam_import_outcome(state, context, result);
             }
-            LibraryOutcome::NamImportCancelled { .. } => state.message = None,
             LibraryOutcome::FolderOpened { result, .. } => match result {
                 Ok(()) => state.message = None,
                 Err(error) => state.message = Some(error),
@@ -410,7 +535,6 @@ fn poll_ir_import_outcome(state: &mut EditorState, context: &PluginContext<MotPl
                     imported.metadata.default_trim_leading_samples
                 ));
             }
-            IrImportOutcome::Cancelled => state.message = None,
             IrImportOutcome::Error(error) => state.message = Some(error),
         }
     }
@@ -526,14 +650,15 @@ fn model_browser(
             });
 
         let busy = context.library_control.is_busy();
+        let picker_busy = file_picker_is_busy(state);
         if ui
-            .add_enabled_ui(!busy, |ui| {
+            .add_enabled_ui(!busy && !picker_busy, |ui| {
                 ui.add_sized([ui.available_width(), 30.0], ghost_button("IMPORT NAM…"))
             })
             .inner
             .clicked()
         {
-            match submit_nam_import_picker(context) {
+            match begin_external_file_picker(state, ExternalFilePickerKind::NamModel) {
                 Ok(()) => {
                     state.message = Some("Choose a NAM model to import…".to_owned());
                 }
@@ -878,8 +1003,12 @@ fn ir_section(
                 });
 
             let busy = context.ir_import_control.is_busy();
-            if ui.add_enabled(!busy, ghost_button("IMPORT…")).clicked() {
-                match submit_ir_import_picker(context) {
+            let picker_busy = file_picker_is_busy(state);
+            if ui
+                .add_enabled(!busy && !picker_busy, ghost_button("IMPORT…"))
+                .clicked()
+            {
+                match begin_external_file_picker(state, ExternalFilePickerKind::CabinetIr) {
                     Ok(()) => {
                         state.message = Some("Choose a WAV cabinet IR to import…".to_owned());
                     }

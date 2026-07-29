@@ -100,9 +100,10 @@ impl EditorUi<GeneratorParams> for GeneratorUi {
                             (normalized_status.clamp(0.0, 1.0) * 7.0).round() as u8;
                         let capture_running = matches!(status_code, 3..=5);
                         let arm_text_color = if armed { background } else { text };
+                        let arm_label = if armed { "ARMED" } else { "ARM" };
                         let mut arm_button = egui::Button::new((
                             egui::Atom::grow(),
-                            RichText::new("ARM")
+                            RichText::new(arm_label)
                                 .strong()
                                 .size(16.0)
                                 .color(arm_text_color),

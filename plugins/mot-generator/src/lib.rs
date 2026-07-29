@@ -16,7 +16,7 @@ use truce_egui::EguiEditor;
 
 use editor::{GeneratorUi, WINDOW_SIZE};
 
-pub const VERSION: &str = "0.4.2";
+pub const VERSION: &str = "0.4.3";
 const READY_CAPACITY: usize = 2;
 const RETIRED_CAPACITY: usize = 4;
 
@@ -204,6 +204,7 @@ pub struct MotGenerator {
     observed_arm_command: u64,
     arm_latched: bool,
     pending_arm: bool,
+    interrupted: bool,
     exact_send_trim_db: f32,
 }
 
@@ -218,6 +219,7 @@ impl Default for MotGenerator {
             observed_arm_command: 0,
             arm_latched: false,
             pending_arm: false,
+            interrupted: false,
             exact_send_trim_db: 0.0,
         }
     }
@@ -295,6 +297,7 @@ impl MotGenerator {
         let requested = arm_command_is_active(command);
         self.arm_latched = requested;
         if requested {
+            self.interrupted = false;
             self.exact_send_trim_db =
                 f32::from_bits(params.arm_send_trim_bits.load(Ordering::Acquire)).clamp(-40.0, 0.0);
             let transport_was_playing = params.arm_transport_was_playing.load(Ordering::Acquire);
@@ -355,13 +358,32 @@ impl PluginLogic for MotGenerator {
 
     fn reset(state: &mut Self::DspState, params: &Self::Params, config: &AudioConfig) {
         state.sample_rate_hz = config.sample_rate.round() as u32;
-        state.observed_arm_command = clear_arm_command(&params.arm_command);
-        state.arm_latched = false;
+        let mut arm_command = params.arm_command.load(Ordering::Acquire);
+        let arm_requested = arm_command_is_active(arm_command);
+        let previous_state = state
+            .prepared
+            .as_ref()
+            .map(|prepared| prepared.engine.state());
+        let capture_was_running = matches!(
+            previous_state,
+            Some(
+                SplitCaptureState::PreRoll { .. }
+                    | SplitCaptureState::Program { .. }
+                    | SplitCaptureState::Tail { .. }
+                    | SplitCaptureState::AlignmentMargin { .. }
+            )
+        );
+        let capture_was_interrupted =
+            state.interrupted || matches!(previous_state, Some(SplitCaptureState::Invalid(_)));
+
         state.pending_arm = false;
         if let Some(prepared) = &mut state.prepared {
             prepared.engine.reset_off_thread();
         }
         if state.sample_rate_hz != CAPTURE_SAMPLE_RATE_HZ {
+            arm_command = clear_arm_command(&params.arm_command);
+            state.arm_latched = false;
+            state.interrupted = true;
             state.load_generation = state.load_generation.wrapping_add(1).max(1);
             state.scheduled_generation = 0;
             params.asset_control.fail(
@@ -371,9 +393,36 @@ impl PluginLogic for MotGenerator {
                     state.sample_rate_hz
                 ),
             );
-        } else if let Some(prepared) = &state.prepared {
-            params.asset_control.mark_ready(prepared.generation);
+        } else if capture_was_running {
+            arm_command = clear_arm_command(&params.arm_command);
+            state.arm_latched = false;
+            state.interrupted = true;
+            if let Some(prepared) = &state.prepared {
+                params.asset_control.mark_ready(prepared.generation);
+            }
+        } else {
+            state.arm_latched = arm_requested;
+            state.interrupted = capture_was_interrupted && !arm_requested;
+            if arm_requested {
+                state.exact_send_trim_db =
+                    f32::from_bits(params.arm_send_trim_bits.load(Ordering::Acquire))
+                        .clamp(-40.0, 0.0);
+                if let Some(prepared) = &mut state.prepared {
+                    let _ = prepared
+                        .engine
+                        .set_send_gain_linear(db_to_gain(state.exact_send_trim_db));
+                    prepared
+                        .engine
+                        .arm(params.arm_transport_was_playing.load(Ordering::Acquire));
+                } else {
+                    state.pending_arm = true;
+                }
+            }
+            if let Some(prepared) = &state.prepared {
+                params.asset_control.mark_ready(prepared.generation);
+            }
         }
+        state.observed_arm_command = arm_command;
     }
 
     fn process(
@@ -433,7 +482,7 @@ impl PluginLogic for MotGenerator {
 }
 
 fn generator_meter_state(state: &MotGenerator, _block_samples: usize) -> (u8, f32) {
-    if state.sample_rate_hz != CAPTURE_SAMPLE_RATE_HZ {
+    if state.sample_rate_hz != CAPTURE_SAMPLE_RATE_HZ || state.interrupted {
         return (7, 0.0);
     }
     let Some(prepared) = &state.prepared else {
@@ -603,6 +652,47 @@ mod tests {
         assert!(!state.arm_latched);
         assert!(!arm_command_is_active(
             params.arm_command.load(Ordering::Acquire)
+        ));
+    }
+
+    #[test]
+    fn host_reset_does_not_swallow_an_unobserved_arm_click() {
+        let params = GeneratorParams::new();
+        params
+            .arm_transport_was_playing
+            .store(false, Ordering::Release);
+        params
+            .arm_send_trim_bits
+            .store((-3.0_f32).to_bits(), Ordering::Release);
+        params.arm_command.fetch_add(1, Ordering::AcqRel);
+
+        let engine = GeneratorEngine::new(
+            load_default_capture_program().unwrap(),
+            CAPTURE_SAMPLE_RATE_HZ,
+            1.0,
+        )
+        .unwrap();
+        let mut state = MotGenerator {
+            prepared: Some(Box::new(PreparedGenerator {
+                generation: 1,
+                engine,
+            })),
+            ..MotGenerator::default()
+        };
+
+        <MotGenerator as PluginLogic>::reset(
+            &mut state,
+            &params,
+            &AudioConfig::new(f64::from(CAPTURE_SAMPLE_RATE_HZ), 64),
+        );
+
+        assert!(state.arm_latched);
+        assert!(arm_command_is_active(
+            params.arm_command.load(Ordering::Acquire)
+        ));
+        assert!(matches!(
+            state.prepared.as_ref().unwrap().engine.state(),
+            SplitCaptureState::Armed
         ));
     }
 

@@ -24,11 +24,15 @@ impl EditorUi<GeneratorParams> for GeneratorUi {
         let text_dim = Color32::from_rgb(135, 148, 155);
         ui.visuals_mut().panel_fill = background;
         ui.visuals_mut().override_text_color = Some(text);
+        let editor_rect = ui.max_rect();
+        let content_width = (editor_rect.width() - 44.0).max(0.0);
+        ui.painter().rect_filled(editor_rect, 0.0, background);
 
         egui::Frame::new()
             .fill(background)
             .inner_margin(22.0)
             .show(ui, |ui| {
+                ui.set_min_width(content_width);
                 ui.horizontal(|ui| {
                     ui.label(
                         RichText::new("MOT GENERATOR")
@@ -49,6 +53,7 @@ impl EditorUi<GeneratorParams> for GeneratorUi {
                     .corner_radius(10.0)
                     .inner_margin(20.0)
                     .show(ui, |ui| {
+                        ui.set_min_width((content_width - 40.0).max(0.0));
                         let load_status = context.asset_control.status();
                         let (status_label, status_color) =
                             status_label(context, load_status, cyan, text_dim);
@@ -93,20 +98,29 @@ impl EditorUi<GeneratorParams> for GeneratorUi {
                         let status_code =
                             (normalized_status.clamp(0.0, 1.0) * 7.0).round() as u8;
                         let capture_running = matches!(status_code, 3..=5);
+                        let arm_text_color = if armed { background } else { text };
+                        let mut arm_button = egui::Button::new((
+                            egui::Atom::grow(),
+                            RichText::new("ARM")
+                                .strong()
+                                .size(16.0)
+                                .color(arm_text_color),
+                            egui::Atom::grow(),
+                        ))
+                        .min_size(egui::vec2(86.0, 36.0));
+                        if armed {
+                            arm_button = arm_button
+                                .fill(cyan)
+                                .stroke(Stroke::new(1.0_f32, cyan));
+                        }
                         let arm = ui.add_enabled(
                             if armed { !capture_running } else { ready },
-                            egui::Button::new((
-                                egui::Atom::grow(),
-                                RichText::new("ARM").strong().size(16.0),
-                                egui::Atom::grow(),
-                            ))
-                                .selected(armed)
-                                .min_size(egui::vec2(86.0, 36.0)),
+                            arm_button,
                         );
                         if arm.clicked() {
                             if !armed {
                                 let transport_was_playing =
-                                    context.transport().is_none_or(|transport| transport.playing);
+                                    context.transport().is_some_and(|transport| transport.playing);
                                 context
                                     .arm_transport_was_playing
                                     .store(transport_was_playing, Ordering::Release);
@@ -144,24 +158,18 @@ fn status_label(
     text_dim: Color32,
 ) -> (&'static str, Color32) {
     if load_status == AssetLoadStatus::Error {
-        return ("ASSET ERROR", Color32::from_rgb(255, 112, 100));
+        return ("Interrupted", Color32::from_rgb(255, 112, 100));
     }
     if load_status == AssetLoadStatus::Loading {
-        return ("LOADING CAPTURE ASSET", text_dim);
+        return ("Ready", text_dim);
     }
 
     let status = (context.get_meter(P::Status).clamp(0.0, 1.0) * 7.0).round() as u8;
     match status {
-        1 => ("READY", accent),
-        2 => ("ARMED — WAITING FOR PLAY", Color32::from_rgb(255, 196, 74)),
-        3 => ("PRE-ROLL", Color32::from_rgb(255, 196, 74)),
-        4 => ("PLAYING CAPTURE WAV", accent),
-        5 => ("TAIL", text_dim),
-        6 => ("COMPLETE", accent),
-        7 => (
-            "INVALID / 48 kHz REQUIRED",
-            Color32::from_rgb(255, 112, 100),
-        ),
-        _ => ("INITIALIZING", text_dim),
+        2 => ("Waiting For Play", Color32::from_rgb(255, 196, 74)),
+        3 => ("Preroll", Color32::from_rgb(255, 196, 74)),
+        4 | 5 => ("Playing Capture wav", accent),
+        7 => ("Interrupted", Color32::from_rgb(255, 112, 100)),
+        _ => ("Ready", accent),
     }
 }

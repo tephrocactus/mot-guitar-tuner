@@ -1,22 +1,22 @@
 mod editor;
 
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use crossbeam_queue::ArrayQueue;
 use mot_core::capture::{CAPTURE_SAMPLE_RATE_HZ, TransportInfo as CaptureTransportInfo};
+use mot_core::capture_asset::load_default_capture_program;
 pub use mot_core::capture_asset::{
     CAPTURE_ASSET_RELATIVE_PATH, CAPTURE_ASSET_SAMPLE_RATE_HZ, CAPTURE_ASSET_SAMPLES,
     CAPTURE_ASSET_SHA256, CAPTURE_PROTOCOL_VERSION, SYNC_HEADER_SAMPLES,
 };
-use mot_core::capture_asset::{capture_asset_path, load_default_capture_program};
 use mot_core::split_capture::{GeneratorEngine, SplitCaptureState};
 use truce::prelude::*;
 use truce_egui::EguiEditor;
 
 use editor::{GeneratorUi, WINDOW_SIZE};
 
-pub const VERSION: &str = "0.4.0";
+pub const VERSION: &str = "0.4.1";
 const READY_CAPACITY: usize = 2;
 const RETIRED_CAPACITY: usize = 4;
 
@@ -139,7 +139,11 @@ pub struct GeneratorParams {
     pub send_trim: FloatParam,
 
     #[skip]
-    pub arm_generation: AtomicU64,
+    pub arm_command: AtomicU64,
+    #[skip]
+    pub arm_transport_was_playing: AtomicBool,
+    #[skip]
+    pub arm_send_trim_bits: AtomicU32,
     #[skip]
     pub asset_control: Arc<AssetControl>,
 
@@ -197,7 +201,8 @@ pub struct MotGenerator {
     sample_rate_hz: u32,
     load_generation: u64,
     scheduled_generation: u64,
-    observed_arm_generation: u64,
+    observed_arm_command: u64,
+    arm_latched: bool,
     pending_arm: bool,
     exact_send_trim_db: f32,
 }
@@ -210,7 +215,8 @@ impl Default for MotGenerator {
             sample_rate_hz: CAPTURE_SAMPLE_RATE_HZ,
             load_generation: 1,
             scheduled_generation: 0,
-            observed_arm_generation: 0,
+            observed_arm_command: 0,
+            arm_latched: false,
             pending_arm: false,
             exact_send_trim_db: 0.0,
         }
@@ -229,7 +235,7 @@ impl MotGenerator {
     }
 
     #[inline]
-    fn poll_prepared(&mut self, params: &GeneratorParams, transport_playing: bool) {
+    fn poll_prepared(&mut self, params: &GeneratorParams) {
         self.retire_pending(params);
         while let Some(prepared) = params.asset_control.take_ready() {
             if prepared.generation != self.load_generation {
@@ -250,7 +256,9 @@ impl MotGenerator {
                 let _ = prepared
                     .engine
                     .set_send_gain_linear(db_to_gain(self.exact_send_trim_db));
-                prepared.engine.arm(transport_playing);
+                prepared
+                    .engine
+                    .arm(params.arm_transport_was_playing.load(Ordering::Acquire));
                 self.pending_arm = false;
             }
         }
@@ -278,21 +286,54 @@ impl MotGenerator {
     }
 
     #[inline]
-    fn observe_arm(&mut self, params: &GeneratorParams, transport_playing: bool) {
-        let requested = params.arm_generation.load(Ordering::Acquire);
-        if requested == self.observed_arm_generation {
+    fn observe_arm_request(&mut self, params: &GeneratorParams) {
+        let command = params.arm_command.load(Ordering::Acquire);
+        if command == self.observed_arm_command {
             return;
         }
-        self.observed_arm_generation = requested;
-        self.exact_send_trim_db = params.send_trim.value().clamp(-40.0, 0.0);
-        if let Some(prepared) = &mut self.prepared {
-            let _ = prepared
-                .engine
-                .set_send_gain_linear(db_to_gain(self.exact_send_trim_db));
-            prepared.engine.arm(transport_playing);
-            self.pending_arm = false;
+        self.observed_arm_command = command;
+        let requested = arm_command_is_active(command);
+        self.arm_latched = requested;
+        if requested {
+            self.exact_send_trim_db =
+                f32::from_bits(params.arm_send_trim_bits.load(Ordering::Acquire)).clamp(-40.0, 0.0);
+            let transport_was_playing = params.arm_transport_was_playing.load(Ordering::Acquire);
+            if let Some(prepared) = &mut self.prepared {
+                let _ = prepared
+                    .engine
+                    .set_send_gain_linear(db_to_gain(self.exact_send_trim_db));
+                prepared.engine.arm(transport_was_playing);
+                self.pending_arm = false;
+            } else {
+                self.pending_arm = true;
+            }
         } else {
-            self.pending_arm = true;
+            self.pending_arm = false;
+            if let Some(prepared) = &mut self.prepared {
+                let _ = prepared.engine.disarm();
+            }
+        }
+    }
+
+    #[inline]
+    fn release_arm_toggle_after_start(&mut self, params: &GeneratorParams) {
+        if !self.arm_latched {
+            return;
+        }
+        let Some(prepared) = &self.prepared else {
+            return;
+        };
+        if matches!(
+            prepared.engine.state(),
+            SplitCaptureState::PreRoll { .. }
+                | SplitCaptureState::Program { .. }
+                | SplitCaptureState::Tail { .. }
+                | SplitCaptureState::AlignmentMargin { .. }
+                | SplitCaptureState::Ready
+                | SplitCaptureState::Invalid(_)
+        ) {
+            self.arm_latched = false;
+            self.observed_arm_command = clear_arm_command(&params.arm_command);
         }
     }
 }
@@ -302,8 +343,9 @@ impl PluginLogic for MotGenerator {
     type DspState = Self;
 
     fn init(params: &Self::Params, _context: &InitContext) -> Self::DspState {
+        let observed_arm_command = clear_arm_command(&params.arm_command);
         Self {
-            observed_arm_generation: params.arm_generation.load(Ordering::Acquire),
+            observed_arm_command,
             ..Self::default()
         }
     }
@@ -318,7 +360,8 @@ impl PluginLogic for MotGenerator {
 
     fn reset(state: &mut Self::DspState, params: &Self::Params, config: &AudioConfig) {
         state.sample_rate_hz = config.sample_rate.round() as u32;
-        state.observed_arm_generation = params.arm_generation.load(Ordering::Acquire);
+        state.observed_arm_command = clear_arm_command(&params.arm_command);
+        state.arm_latched = false;
         state.pending_arm = false;
         if let Some(prepared) = &mut state.prepared {
             prepared.engine.reset_off_thread();
@@ -345,9 +388,9 @@ impl PluginLogic for MotGenerator {
         _events: &EventList,
         context: &mut ProcessContext,
     ) -> ProcessStatus {
-        state.poll_prepared(params, context.transport.playing);
+        state.poll_prepared(params);
         state.schedule_load(params, context);
-        state.observe_arm(params, context.transport.playing);
+        state.observe_arm_request(params);
 
         let samples = buffer.num_samples();
         if buffer.num_output_channels() > 0 {
@@ -369,6 +412,7 @@ impl PluginLogic for MotGenerator {
                 );
             }
         }
+        state.release_arm_toggle_after_start(params);
 
         let (status, progress) = generator_meter_state(state, samples);
         context.set_meter(P::Status, f32::from(status) / 7.0);
@@ -425,11 +469,23 @@ fn db_to_gain(db: f32) -> f32 {
     10.0_f32.powf(db.clamp(-40.0, 0.0) / 20.0)
 }
 
-pub(crate) fn canonical_asset_path_display() -> String {
-    capture_asset_path().map_or_else(
-        |_| format!("~/Library/Application Support/Plut&Mot/MOT Guitar Plugin/{CAPTURE_ASSET_RELATIVE_PATH}"),
-        |path| path.display().to_string(),
-    )
+#[inline]
+pub(crate) const fn arm_command_is_active(command: u64) -> bool {
+    command & 1 == 1
+}
+
+fn clear_arm_command(command: &AtomicU64) -> u64 {
+    let mut current = command.load(Ordering::Acquire);
+    loop {
+        if !arm_command_is_active(current) {
+            return current;
+        }
+        let cleared = current.wrapping_add(1);
+        match command.compare_exchange_weak(current, cleared, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return cleared,
+            Err(actual) => current = actual,
+        }
+    }
 }
 
 truce::plugin! {
@@ -477,6 +533,62 @@ mod tests {
         assert!(!generator_can_arm(AssetLoadStatus::Loading, 0.0));
         assert!(!generator_can_arm(AssetLoadStatus::Error, 1.0));
         assert!(!generator_can_arm(AssetLoadStatus::Ready, f32::NAN));
+    }
+
+    #[test]
+    fn arm_uses_the_ui_transport_snapshot_and_releases_after_start() {
+        let params = GeneratorParams::new();
+        params
+            .arm_transport_was_playing
+            .store(false, Ordering::Release);
+        params
+            .arm_send_trim_bits
+            .store((-6.0_f32).to_bits(), Ordering::Release);
+        params.arm_command.fetch_add(1, Ordering::AcqRel);
+
+        let engine = GeneratorEngine::new(
+            load_default_capture_program().unwrap(),
+            CAPTURE_SAMPLE_RATE_HZ,
+            1.0,
+        )
+        .unwrap();
+        let mut state = MotGenerator {
+            prepared: Some(Box::new(PreparedGenerator {
+                generation: 1,
+                engine,
+            })),
+            ..MotGenerator::default()
+        };
+
+        state.observe_arm_request(&params);
+        assert!(state.arm_latched);
+        assert!(matches!(
+            state.prepared.as_ref().unwrap().engine.state(),
+            SplitCaptureState::Armed
+        ));
+
+        let mut output = [1.0_f32; 64];
+        state.prepared.as_mut().unwrap().engine.process_block(
+            &mut output,
+            CaptureTransportInfo {
+                playing: true,
+                timeline_sample: Some(0),
+                sample_rate_hz: CAPTURE_SAMPLE_RATE_HZ,
+                ..CaptureTransportInfo::default()
+            },
+        );
+        assert!(matches!(
+            state.prepared.as_ref().unwrap().engine.state(),
+            SplitCaptureState::PreRoll {
+                completed_samples: 64
+            }
+        ));
+
+        state.release_arm_toggle_after_start(&params);
+        assert!(!state.arm_latched);
+        assert!(!arm_command_is_active(
+            params.arm_command.load(Ordering::Acquire)
+        ));
     }
 
     #[test]

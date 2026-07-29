@@ -269,6 +269,22 @@ impl GeneratorEngine {
         self.clock.arm(transport_is_playing);
     }
 
+    /// Cancels an armed capture before the stopped-to-playing edge.
+    ///
+    /// Returns `true` when the pending capture was disarmed. Once generation
+    /// has started, transport rules remain authoritative and this is a no-op.
+    pub fn disarm(&mut self) -> bool {
+        if matches!(
+            self.clock.status,
+            ClockStatus::Armed | ClockStatus::WaitingForTransport
+        ) {
+            self.clock.reset();
+            true
+        } else {
+            false
+        }
+    }
+
     /// Control-thread reset. This does not allocate, but must not race with
     /// `process_block`.
     pub fn reset_off_thread(&mut self) {
@@ -886,6 +902,23 @@ mod tests {
         let mut full_window = vec![f32::NAN; generator.total_samples()];
         generator.process_block(&mut full_window, transport(true, START_TIMELINE));
         assert_eq!(generator.state(), SplitCaptureState::Ready);
+    }
+
+    #[test]
+    fn generator_can_disarm_before_transport_starts() {
+        let mut generator = GeneratorEngine::new(program(), CAPTURE_SAMPLE_RATE_HZ, 1.0).unwrap();
+        generator.arm(false);
+        generator.process_block(&mut [0.0; 11], transport(false, START_TIMELINE));
+        assert_eq!(generator.state(), SplitCaptureState::WaitingForTransport);
+
+        assert!(generator.disarm());
+        assert_eq!(generator.state(), SplitCaptureState::Idle);
+
+        let mut output = [f32::NAN; 17];
+        generator.process_block(&mut output, transport(true, START_TIMELINE));
+        assert!(output.iter().all(|sample| *sample == 0.0));
+        assert_eq!(generator.state(), SplitCaptureState::Idle);
+        assert!(!generator.disarm());
     }
 
     #[test]

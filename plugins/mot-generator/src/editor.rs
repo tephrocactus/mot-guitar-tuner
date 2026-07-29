@@ -6,10 +6,10 @@ use truce::prelude::*;
 use truce_egui::EditorUi;
 
 use crate::{
-    AssetLoadStatus, GeneratorParams, P, VERSION, canonical_asset_path_display, generator_can_arm,
+    AssetLoadStatus, GeneratorParams, P, VERSION, arm_command_is_active, generator_can_arm,
 };
 
-pub(crate) const WINDOW_SIZE: (u32, u32) = (720, 420);
+pub(crate) const WINDOW_SIZE: (u32, u32) = (720, 300);
 
 pub(crate) struct GeneratorUi;
 
@@ -64,11 +64,7 @@ impl EditorUi<GeneratorParams> for GeneratorUi {
 
                         ui.add_space(14.0);
                         ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new("SEND TRIM")
-                                    .strong()
-                                    .color(cyan),
-                            );
+                            ui.label(RichText::new("SEND TRIM").color(text_dim));
                             let mut send_trim = context.send_trim.value();
                             let response = ui.add(
                                 egui::Slider::new(&mut send_trim, -40.0..=0.0)
@@ -90,69 +86,46 @@ impl EditorUi<GeneratorParams> for GeneratorUi {
                         });
 
                         ui.add_space(18.0);
-                        let ready =
-                            generator_can_arm(load_status, context.get_meter(P::Status));
+                        let normalized_status = context.get_meter(P::Status);
+                        let ready = generator_can_arm(load_status, normalized_status);
+                        let arm_command = context.arm_command.load(Ordering::Acquire);
+                        let armed = arm_command_is_active(arm_command);
                         let arm = ui.add_enabled(
-                            ready,
-                            egui::Button::new(
-                                RichText::new("ARM NEXT PLAY")
-                                    .strong()
-                                    .size(17.0),
-                            )
-                            .min_size(egui::vec2(190.0, 42.0)),
+                            armed || ready,
+                            egui::Button::new(RichText::new("ARM").strong().size(16.0))
+                                .selected(armed)
+                                .min_size(egui::vec2(86.0, 36.0)),
                         );
                         if arm.clicked() {
-                            context.arm_generation.fetch_add(1, Ordering::AcqRel);
+                            if !armed {
+                                let transport_was_playing =
+                                    context.transport().is_none_or(|transport| transport.playing);
+                                context
+                                    .arm_transport_was_playing
+                                    .store(transport_was_playing, Ordering::Release);
+                                context.arm_send_trim_bits.store(
+                                    context.send_trim.value().clamp(-40.0, 0.0).to_bits(),
+                                    Ordering::Release,
+                                );
+                            }
+                            context.arm_command.fetch_add(1, Ordering::AcqRel);
                         }
-                        ui.label(
-                            RichText::new(
-                                "After ARM, stop the transport if necessary; generation starts on the next stopped → playing edge.",
-                            )
-                            .color(text_dim),
-                        );
+                        if armed {
+                            ui.add_space(8.0);
+                            ui.label(
+                                RichText::new(
+                                    "Now click Play in a DAW's transport panel. Stop playback if already playing",
+                                )
+                                .color(text_dim),
+                            );
+                        }
 
                         ui.add_space(18.0);
                         let progress = context.get_meter(P::Progress).clamp(0.0, 1.0);
                         ui.add(
                             egui::ProgressBar::new(progress)
-                                .show_percentage()
-                                .animate(progress > 0.0 && progress < 1.0),
+                                .show_percentage(),
                         );
-                    });
-
-                ui.add_space(14.0);
-                egui::Frame::new()
-                    .fill(panel)
-                    .corner_radius(8.0)
-                    .inner_margin(14.0)
-                    .show(ui, |ui| {
-                        ui.label(RichText::new("CROSS-BUNDLE CONTRACT").color(cyan));
-                        ui.label(
-                            RichText::new(canonical_asset_path_display())
-                                .monospace()
-                                .color(text_dim),
-                        );
-                        ui.label(
-                            RichText::new(format!("SHA-256  {}", crate::CAPTURE_ASSET_SHA256))
-                                .monospace()
-                                .color(text_dim),
-                        );
-                        ui.label(
-                            RichText::new(format!(
-                                "Latched Source trim  {:+.1} dB",
-                                context.get_meter(P::ExactSendTrim) * 40.0 - 40.0
-                            ))
-                            .monospace()
-                            .color(text),
-                        );
-                        let error = context.asset_control.last_error();
-                        if !error.is_empty() {
-                            ui.add_space(8.0);
-                            ui.label(
-                                RichText::new(error)
-                                    .color(Color32::from_rgb(255, 112, 100)),
-                            );
-                        }
                     });
             });
     }

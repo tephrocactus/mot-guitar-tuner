@@ -141,7 +141,7 @@ fn model_browser(
             write_lock_string(&context.model_name, "");
         }
 
-        let controls_height = 76.0;
+        let controls_height = 100.0;
         let list_height = (ui.available_height() - controls_height).max(96.0);
         let models = state.models.clone();
         egui::ScrollArea::vertical()
@@ -172,24 +172,25 @@ fn model_browser(
             });
 
         ui.separator();
-        ui.horizontal_wrapped(|ui| {
-            let busy = context.model_control.is_busy();
-            if ui
-                .add_enabled(!busy, ghost_button("REFRESH").small())
-                .clicked()
-            {
-                request_model_catalog(state, context);
-            }
-            if ui
-                .add_enabled(!busy, ghost_button("OPEN FOLDER").small())
-                .clicked()
-            {
-                state.model_message = open_models_folder().err();
-            }
-            if busy {
-                ui.label(RichText::new("BUSY").small().monospace().color(DIM));
-            }
-        });
+        let busy = context.model_control.is_busy();
+        if ui
+            .add_enabled(
+                !busy,
+                browser_action_button("REFRESH", ui.available_width()),
+            )
+            .clicked()
+        {
+            request_model_catalog(state, context);
+        }
+        if ui
+            .add(browser_action_button("OPEN FOLDER", ui.available_width()))
+            .clicked()
+        {
+            state.model_message = open_models_folder().err();
+        }
+        if busy {
+            ui.label(RichText::new("BUSY").small().monospace().color(DIM));
+        }
 
         if let Some(message) = &state.model_message {
             ui.label(
@@ -199,6 +200,12 @@ fn model_browser(
             );
         }
     });
+}
+
+fn browser_action_button(label: &'static str, width: f32) -> egui::Button<'static> {
+    egui::Button::new(RichText::new(label).small())
+        .corner_radius(mot_ui::CONTROL_RADIUS)
+        .min_size(Vec2::new(width, 28.0))
 }
 
 fn model_card(
@@ -253,14 +260,18 @@ fn open_models_folder() -> Result<(), String> {
     library
         .ensure_directories()
         .map_err(|error| error.to_string())?;
-    Command::new("/usr/bin/open")
+    let status = Command::new("/usr/bin/open")
         .arg(&library.paths().models)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
-        .map(|_| ())
-        .map_err(|error| format!("Could not open model folder: {error}"))
+        .status()
+        .map_err(|error| format!("Could not open model folder: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("Could not open model folder: {status}"))
+    }
 }
 
 fn main_workspace(

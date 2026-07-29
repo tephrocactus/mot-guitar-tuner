@@ -1189,7 +1189,6 @@ pub struct HardwareCaptureMetadata {
     pub input_level_dbu: Option<f32>,
     pub output_level_dbu: Option<f32>,
     pub sample_rate_hz: u32,
-    pub source_send_trim_db: f32,
     pub measured_latency_samples: Option<f64>,
     pub return_peak_dbfs: Option<f32>,
     pub return_rms_dbfs: Option<f32>,
@@ -1214,7 +1213,6 @@ impl HardwareCaptureMetadata {
             input_level_dbu: None,
             output_level_dbu: None,
             sample_rate_hz: CAPTURE_SAMPLE_RATE_HZ,
-            source_send_trim_db: 0.0,
             measured_latency_samples: None,
             return_peak_dbfs: None,
             return_rms_dbfs: None,
@@ -1250,7 +1248,6 @@ struct SessionSlot {
     abort_reason: AtomicU8,
     source_phase: AtomicU8,
     return_phase: AtomicU8,
-    source_send_trim_bits: AtomicU32,
     check_level_generation: AtomicU64,
     check_level_state: AtomicU8,
     check_level_progress_bits: AtomicU32,
@@ -1268,7 +1265,6 @@ impl SessionSlot {
             abort_reason: AtomicU8::new(NO_ABORT),
             source_phase: AtomicU8::new(CapturePhase::Idle as u8),
             return_phase: AtomicU8::new(CapturePhase::Idle as u8),
-            source_send_trim_bits: AtomicU32::new((-20.0_f32).to_bits()),
             check_level_generation: AtomicU64::new(0),
             check_level_state: AtomicU8::new(SessionCheckLevelState::Required as u8),
             check_level_progress_bits: AtomicU32::new(0.0_f32.to_bits()),
@@ -1608,32 +1604,6 @@ impl CaptureBinding {
             destination.store(phase as u8, Ordering::Release);
         }
     }
-
-    /// Publishes the exact gain used by the Source instance. The Return
-    /// instance reads this value when it hands the aligned capture to the
-    /// trainer, so the trainer's input is the exact emitted excitation rather
-    /// than an independently configured approximation.
-    #[inline]
-    pub fn publish_source_send_trim_db(&self, trim_db: f32) {
-        if self.role == CaptureRole::Source {
-            let slot = self.slot();
-            let new_bits = trim_db.clamp(-40.0, 0.0).to_bits();
-            let previous_bits = slot.source_send_trim_bits.swap(new_bits, Ordering::AcqRel);
-            if previous_bits != new_bits {
-                // The safety result is tied to the exact level that reached
-                // the routed chain. It cannot authorize capture at a later,
-                // potentially much hotter Source setting.
-                slot.reset_check_level();
-            }
-        }
-    }
-
-    /// Returns the Source send trim shared by the capture pair.
-    #[inline]
-    #[must_use]
-    pub fn source_send_trim_db(&self) -> f32 {
-        f32::from_bits(self.slot().source_send_trim_bits.load(Ordering::Acquire)).clamp(-40.0, 0.0)
-    }
 }
 
 impl Drop for CaptureBinding {
@@ -1660,8 +1630,6 @@ impl Drop for CaptureBinding {
             slot.arm_generation.store(0, Ordering::Release);
             slot.arm_transport_playing.store(0, Ordering::Release);
             slot.abort_reason.store(NO_ABORT, Ordering::Release);
-            slot.source_send_trim_bits
-                .store((-20.0_f32).to_bits(), Ordering::Release);
             let _ = slot.session_id.compare_exchange(
                 self.session_id.get(),
                 NO_SESSION,
@@ -2072,7 +2040,7 @@ mod tests {
     }
 
     #[test]
-    fn two_instances_capture_across_tracks_with_exact_stages_and_send_trim() {
+    fn two_instances_capture_across_tracks_with_exact_stages() {
         let coordinator = CaptureCoordinator::with_capacity(1);
         let source_binding = coordinator
             .bind(session_id(), CaptureRole::Source, 100)
@@ -2090,10 +2058,6 @@ mod tests {
             .prepare(Arc::clone(&program), CAPTURE_SAMPLE_RATE_HZ)
             .unwrap();
 
-        let send_trim_db = -6.3_f32;
-        let send_gain = 10.0_f32.powf(send_trim_db / 20.0);
-        source_binding.publish_source_send_trim_db(send_trim_db);
-        assert_eq!(return_binding.source_send_trim_db(), send_trim_db);
         pass_pair_check(&return_binding);
         let generation = source_binding.arm_pair(false).unwrap();
 
@@ -2110,9 +2074,6 @@ mod tests {
             let silent = vec![0.0; block_size];
             let mut source_output = vec![f32::NAN; block_size];
             source.process_block(&silent, &mut source_output, transport(true, timeline));
-            for sample in &mut source_output {
-                *sample *= send_gain;
-            }
             captured_return.extend_from_slice(&source_output);
 
             let mut return_output = vec![1.0; block_size];
@@ -2140,7 +2101,7 @@ mod tests {
         );
         assert_eq!(
             captured_return[program.sync_start_sample()],
-            program.sync_header()[0] * send_gain
+            program.sync_header()[0]
         );
         let tail_start = PRE_ROLL_SAMPLES + program.program_samples();
         assert!(
@@ -2292,35 +2253,6 @@ mod tests {
             .unwrap();
         assert_eq!(
             replacement.arm_pair(false),
-            Err(CoordinatorError::CheckLevelNotPassed(
-                SessionCheckLevelState::Required
-            ))
-        );
-    }
-
-    #[test]
-    fn changing_source_send_trim_invalidates_a_pass_but_republishing_it_does_not() {
-        let coordinator = CaptureCoordinator::with_capacity(1);
-        let source = coordinator
-            .bind(session_id(), CaptureRole::Source, 100)
-            .unwrap();
-        let returned = coordinator
-            .bind(session_id(), CaptureRole::Return, 200)
-            .unwrap();
-        source.publish_source_send_trim_db(-12.0);
-        pass_pair_check(&returned);
-        let passed = source.check_level_snapshot();
-        assert_eq!(passed.state, SessionCheckLevelState::Passed);
-
-        source.publish_source_send_trim_db(-12.0);
-        assert_eq!(source.check_level_snapshot(), passed);
-
-        source.publish_source_send_trim_db(-6.0);
-        let invalidated = source.check_level_snapshot();
-        assert_eq!(invalidated.state, SessionCheckLevelState::Required);
-        assert_ne!(invalidated.generation, passed.generation);
-        assert_eq!(
-            source.arm_pair(false),
             Err(CoordinatorError::CheckLevelNotPassed(
                 SessionCheckLevelState::Required
             ))

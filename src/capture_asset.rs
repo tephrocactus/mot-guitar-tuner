@@ -16,7 +16,7 @@ pub const CAPTURE_ASSET_SHA256: &str =
 pub const CAPTURE_ASSET_SAMPLE_RATE_HZ: u32 = 48_000;
 pub const CAPTURE_ASSET_SAMPLES: usize = 9_120_000;
 pub const SYNC_HEADER_SAMPLES: usize = 4_096;
-pub const CAPTURE_PROTOCOL_VERSION: u32 = 1;
+pub const CAPTURE_PROTOCOL_VERSION: u32 = 2;
 
 static CAPTURE_PROGRAM: OnceLock<Arc<CaptureProgram>> = OnceLock::new();
 

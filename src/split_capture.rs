@@ -43,7 +43,6 @@ pub enum SplitCaptureState {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SplitCapturePrepareError {
     UnsupportedSampleRate(u32),
-    InvalidSendGain,
     RecordingLengthOverflow,
     CompletedRecordingPending,
     RecordingStorageUnavailable,
@@ -59,7 +58,6 @@ impl fmt::Display for SplitCapturePrepareError {
                     "split capture requires 48000 Hz, received {rate} Hz"
                 )
             }
-            Self::InvalidSendGain => formatter.write_str("send gain must be finite"),
             Self::RecordingLengthOverflow => {
                 formatter.write_str("the split-capture recording window is too long")
             }
@@ -211,7 +209,6 @@ pub struct GeneratorEngine {
     program: Arc<CaptureProgram>,
     alignment_margin_samples: usize,
     generation_samples: usize,
-    send_gain_linear: f32,
     clock: CaptureClock,
 }
 
@@ -219,26 +216,16 @@ impl GeneratorEngine {
     pub fn new(
         program: Arc<CaptureProgram>,
         sample_rate_hz: u32,
-        send_gain_linear: f32,
     ) -> Result<Self, SplitCapturePrepareError> {
-        Self::with_alignment_margin(
-            program,
-            sample_rate_hz,
-            send_gain_linear,
-            DEFAULT_ALIGNMENT_MARGIN_SAMPLES,
-        )
+        Self::with_alignment_margin(program, sample_rate_hz, DEFAULT_ALIGNMENT_MARGIN_SAMPLES)
     }
 
     pub fn with_alignment_margin(
         program: Arc<CaptureProgram>,
         sample_rate_hz: u32,
-        send_gain_linear: f32,
         alignment_margin_samples: usize,
     ) -> Result<Self, SplitCapturePrepareError> {
         validate_sample_rate(sample_rate_hz)?;
-        if !send_gain_linear.is_finite() {
-            return Err(SplitCapturePrepareError::InvalidSendGain);
-        }
         let generation_samples = program
             .total_capture_samples()
             .checked_add(alignment_margin_samples)
@@ -247,21 +234,8 @@ impl GeneratorEngine {
             program,
             alignment_margin_samples,
             generation_samples,
-            send_gain_linear,
             clock: CaptureClock::default(),
         })
-    }
-
-    /// Changes the source trim outside the audio callback.
-    pub fn set_send_gain_linear(
-        &mut self,
-        send_gain_linear: f32,
-    ) -> Result<(), SplitCapturePrepareError> {
-        if !send_gain_linear.is_finite() {
-            return Err(SplitCapturePrepareError::InvalidSendGain);
-        }
-        self.send_gain_linear = send_gain_linear;
-        Ok(())
     }
 
     /// Requires a future stopped-to-playing edge.
@@ -328,8 +302,7 @@ impl GeneratorEngine {
         let remaining = total_samples.saturating_sub(self.clock.position);
         let processed = remaining.min(output.len());
         for (offset, output_sample) in output[..processed].iter_mut().enumerate() {
-            *output_sample =
-                self.program.emitted_sample(self.clock.position + offset) * self.send_gain_linear;
+            *output_sample = self.program.emitted_sample(self.clock.position + offset);
         }
         self.clock.position += processed;
         if self.clock.position == total_samples {
@@ -676,12 +649,10 @@ mod tests {
 
     fn render_generator(
         program: Arc<CaptureProgram>,
-        send_gain: f32,
         block_pattern: &[usize],
         sample_count: usize,
     ) -> Vec<f32> {
-        let mut generator =
-            GeneratorEngine::new(program, CAPTURE_SAMPLE_RATE_HZ, send_gain).unwrap();
+        let mut generator = GeneratorEngine::new(program, CAPTURE_SAMPLE_RATE_HZ).unwrap();
         generator.arm(false);
         let mut stopped = [1.0; 13];
         generator.process_block(&mut stopped, transport(false, START_TIMELINE));
@@ -758,7 +729,6 @@ mod tests {
         program: &CaptureProgram,
         recording: &CompletedTrainerRecording,
         delay: usize,
-        send_gain: f32,
     ) {
         let alignment = measure_alignment(
             program,
@@ -775,7 +745,7 @@ mod tests {
         let aligned = extract_aligned_excitation(program, recording.audio(), alignment).unwrap();
         assert_eq!(aligned.len(), program.excitation().len());
         for (&actual, &excitation) in aligned.iter().zip(program.excitation()) {
-            let expected = target_processor(excitation * send_gain);
+            let expected = target_processor(excitation);
             assert!(
                 (actual - expected).abs() < 2.0e-3,
                 "actual {actual}, expected {expected}, alignment {alignment:?}"
@@ -787,39 +757,30 @@ mod tests {
     fn same_odd_host_blocks_align_a_delayed_processed_target() {
         let program = program();
         let margin = 1_024;
-        let send_gain = 0.71;
         let total = program.total_capture_samples() + margin;
         let block_pattern = [1, 7, 31, 63, 257];
-        let source = render_generator(Arc::clone(&program), send_gain, &block_pattern, total);
+        let source = render_generator(Arc::clone(&program), &block_pattern, total);
         let returned = delayed_target(&source, 137);
         let recording = record_trainer(Arc::clone(&program), &returned, &block_pattern, margin);
-        assert_alignment_recovers_target(&program, &recording, 137, send_gain);
+        assert_alignment_recovers_target(&program, &recording, 137);
     }
 
     #[test]
     fn different_odd_host_blocks_remain_transport_synchronized() {
         let program = program();
         let margin = 2_048;
-        let send_gain = 0.43;
         let total = program.total_capture_samples() + margin;
-        let source = render_generator(
-            Arc::clone(&program),
-            send_gain,
-            &[3, 17, 65, 129, 511],
-            total,
-        );
+        let source = render_generator(Arc::clone(&program), &[3, 17, 65, 129, 511], total);
         let returned = delayed_target(&source, 733);
         let recording = record_trainer(Arc::clone(&program), &returned, &[5, 11, 37, 251], margin);
-        assert_alignment_recovers_target(&program, &recording, 733, send_gain);
+        assert_alignment_recovers_target(&program, &recording, 733);
     }
 
     #[test]
     fn generator_window_has_exact_preroll_program_and_tail() {
         let program = program();
-        let gain = 0.25;
         let rendered = render_generator(
             Arc::clone(&program),
-            gain,
             &[1, 7, 16, 257],
             program.total_capture_samples(),
         );
@@ -836,7 +797,7 @@ mod tests {
             .iter()
             .zip(program.sync_header().iter().chain(program.excitation()))
         {
-            assert_eq!(actual, expected * gain);
+            assert_eq!(actual, *expected);
         }
         assert!(
             rendered[rendered.len() - TAIL_SAMPLES..]
@@ -849,7 +810,7 @@ mod tests {
     fn generator_and_trainer_share_the_default_full_window() {
         let program = program();
         let mut generator =
-            GeneratorEngine::new(Arc::clone(&program), CAPTURE_SAMPLE_RATE_HZ, 1.0).unwrap();
+            GeneratorEngine::new(Arc::clone(&program), CAPTURE_SAMPLE_RATE_HZ).unwrap();
         let trainer = TrainerRecorder::new(Arc::clone(&program), CAPTURE_SAMPLE_RATE_HZ).unwrap();
 
         assert_eq!(
@@ -886,8 +847,7 @@ mod tests {
     fn generator_can_rearm_after_transport_invalidation() {
         let program = program();
         let mut generator =
-            GeneratorEngine::with_alignment_margin(program, CAPTURE_SAMPLE_RATE_HZ, 1.0, 32)
-                .unwrap();
+            GeneratorEngine::with_alignment_margin(program, CAPTURE_SAMPLE_RATE_HZ, 32).unwrap();
         generator.arm(false);
         generator.process_block(&mut [0.0; 16], transport(true, START_TIMELINE));
         generator.process_block(&mut [0.0; 16], transport(true, START_TIMELINE + 99));
@@ -906,7 +866,7 @@ mod tests {
 
     #[test]
     fn generator_can_disarm_before_transport_starts() {
-        let mut generator = GeneratorEngine::new(program(), CAPTURE_SAMPLE_RATE_HZ, 1.0).unwrap();
+        let mut generator = GeneratorEngine::new(program(), CAPTURE_SAMPLE_RATE_HZ).unwrap();
         generator.arm(false);
         generator.process_block(&mut [0.0; 11], transport(false, START_TIMELINE));
         assert_eq!(generator.state(), SplitCaptureState::WaitingForTransport);
@@ -981,7 +941,7 @@ mod tests {
 
         for (hazard, expected) in cases {
             let mut generator =
-                GeneratorEngine::new(Arc::clone(&program), CAPTURE_SAMPLE_RATE_HZ, 1.0).unwrap();
+                GeneratorEngine::new(Arc::clone(&program), CAPTURE_SAMPLE_RATE_HZ).unwrap();
             generator.arm(false);
             generator.process_block(&mut [0.0; 16], transport(true, START_TIMELINE));
             generator.process_block(&mut [0.0; 16], hazard);

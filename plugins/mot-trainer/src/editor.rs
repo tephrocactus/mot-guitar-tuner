@@ -33,7 +33,7 @@ impl EditorUi<MotTrainerParams> for MotTrainerUi {
                             .strong(),
                     );
                     ui.label(
-                        RichText::new("0.4.0  •  MONO  •  48 kHz")
+                        RichText::new("0.4.1  •  MONO  •  48 kHz")
                             .monospace()
                             .color(dim),
                     );
@@ -71,21 +71,6 @@ impl EditorUi<MotTrainerParams> for MotTrainerUi {
                                     dim,
                                 );
 
-                                ui.label(RichText::new("SOURCE SEND TRIM").color(dim));
-                                let mut trim = context.source_send_trim_db.value();
-                                if ui
-                                    .add(
-                                        egui::Slider::new(&mut trim, -40.0..=0.0)
-                                            .suffix(" dB")
-                                            .step_by(0.1)
-                                            .fixed_decimals(1),
-                                    )
-                                    .changed()
-                                {
-                                    automate_linear(context, P::SourceSendTrimDb, trim, -40.0, 0.0);
-                                }
-                                ui.end_row();
-
                                 ui.label(RichText::new("MAX PASSES").color(dim));
                                 let mut epochs = context.max_epochs.value_i32();
                                 if ui
@@ -96,24 +81,6 @@ impl EditorUi<MotTrainerParams> for MotTrainerUi {
                                 }
                                 ui.end_row();
                             });
-                        ui.add_space(8.0);
-                        ui.label(
-                            RichText::new(
-                                "SOURCE SEND TRIM must exactly match MOT GENERATOR. Both plug-ins \
-                                 use the same immutable excitation WAV and transport edge.",
-                            )
-                            .small()
-                            .color(Color32::from_rgb(235, 164, 77)),
-                        );
-                        ui.label(
-                            RichText::new(format!(
-                                "LATCHED AT ARM  {:+.1} dB",
-                                context.get_meter(P::LatchedSourceTrim) * 40.0 - 40.0
-                            ))
-                            .small()
-                            .monospace()
-                            .color(dim),
-                        );
                     });
 
                 ui.add_space(12.0);
@@ -349,17 +316,6 @@ fn text_field(
         write_lock_string(value, &edited);
     }
     ui.end_row();
-}
-
-fn automate_linear(
-    context: &PluginContext<MotTrainerParams>,
-    id: P,
-    value: f32,
-    minimum: f32,
-    maximum: f32,
-) {
-    let normalized = ((value - minimum) / (maximum - minimum)).clamp(0.0, 1.0);
-    context.automate(id, f64::from(normalized));
 }
 
 impl TrainerStatus {

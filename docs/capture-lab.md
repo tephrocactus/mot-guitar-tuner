@@ -65,9 +65,10 @@ Disable every stage that should not become part of the learned amp:
 - post EQ and limiter;
 - normalization/lookahead processing.
 
-`SEND TRIM` defaults to `0.0 dB`. Enter the exact same value into Trainer's
-`SOURCE SEND TRIM`; the value is part of the training input and is not
-normalized away.
+MOT GENERATOR emits the immutable excitation at unity. MOT TRAINER loads the
+same verified asset and uses it directly as the training input; there is no
+manual gain value to synchronize between the plug-ins and the input is not
+normalized.
 
 ## Hardware amplifier
 
@@ -90,7 +91,11 @@ output to prevent feedback.
 
 Hardware captures remain explicitly uncalibrated. Record the interface,
 reamp/load, amp/channel/control positions, impedance, and Return gain in
-Trainer's metadata panel.
+Trainer's metadata panel. Set amplifier drive with the interface output and
+reamp box. If the Return clips, reduce the load-box line output or interface
+Return gain rather than changing the amplifier drive and therefore the
+captured tone. Never place an attenuator between Speaker Out and the required
+reactive load unless it is explicitly designed and rated for that use.
 
 ## Alignment, training, and files
 
@@ -124,8 +129,6 @@ PLAYER's audio callback.
 
 ## First-version limitations
 
-- Generator and Trainer cannot prove each other's manually entered Send Trim;
-  match the displayed values exactly and do not automate either value.
 - Use exactly one armed Generator in the reachable routing graph. Version 0.4
   has no cross-bundle Session ID and cannot distinguish a summed second source.
 - There is no cross-bundle automatic level-probe handshake yet. Set a safe

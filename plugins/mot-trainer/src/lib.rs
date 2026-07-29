@@ -306,8 +306,6 @@ pub struct MotTrainerParams {
     pub bypass: BoolParam,
     #[param(name = "Target", range = "discrete(0, 1)", default = 0)]
     pub target: IntParam,
-    #[param(name = "Source Send Trim", range = "linear(-40, 0)", default = 0)]
-    pub source_send_trim_db: FloatParam,
     #[param(name = "Max Passes", range = "discrete(1, 400)", default = 400)]
     pub max_epochs: IntParam,
 
@@ -345,8 +343,6 @@ pub struct MotTrainerParams {
     pub return_peak: MeterSlot,
     #[meter]
     pub training_progress: MeterSlot,
-    #[meter]
-    pub latched_source_trim: MeterSlot,
 }
 
 pub(crate) use MotTrainerParamsParamId as P;
@@ -396,7 +392,6 @@ impl BackgroundTask for RetireRecorderTask {
 #[derive(Debug)]
 struct TrainRecordingTask {
     recording: CompletedTrainerRecording,
-    source_send_trim_db: f32,
     generation: u64,
 }
 
@@ -413,7 +408,7 @@ impl BackgroundTask for TrainRecordingTask {
             return;
         }
         let max_epochs = params.max_epochs.value_i32().clamp(1, 400) as u32;
-        let metadata = metadata_from_params(params, self.source_send_trim_db);
+        let metadata = metadata_from_params(params);
         let display_name = {
             let name = read_lock_string(&params.model_name);
             if name.trim().is_empty() {
@@ -427,7 +422,6 @@ impl BackgroundTask for TrainRecordingTask {
             &params.control,
             self.generation,
             self.recording,
-            self.source_send_trim_db,
             max_epochs,
             &display_name,
             metadata,
@@ -467,7 +461,6 @@ pub struct MotTrainer {
     observed_arm_generation: u64,
     requested_prepare_generation: u64,
     sample_rate_hz: u32,
-    latched_source_send_trim_db: f32,
 }
 
 impl Default for MotTrainer {
@@ -480,7 +473,6 @@ impl Default for MotTrainer {
             observed_arm_generation: 0,
             requested_prepare_generation: 0,
             sample_rate_hz: CAPTURE_SAMPLE_RATE_HZ,
-            latched_source_send_trim_db: 0.0,
         }
     }
 }
@@ -508,7 +500,6 @@ impl PluginLogic for MotTrainer {
         state.sample_rate_hz = config.sample_rate.round() as u32;
         state.recorder_active = false;
         state.observed_arm_generation = params.arm_generation.load(Ordering::Acquire);
-        state.latched_source_send_trim_db = params.source_send_trim_db.value().clamp(-40.0, 0.0);
         params.control.begin_training_generation();
         let generation = params.prepare_generation.load().wrapping_add(1).max(1);
         params.prepare_generation.store(generation);
@@ -549,8 +540,6 @@ impl PluginLogic for MotTrainer {
             if let Some(recorder) = &mut state.recorder {
                 match recorder.arm(context.transport.playing) {
                     Ok(()) => {
-                        state.latched_source_send_trim_db =
-                            params.source_send_trim_db.value().clamp(-40.0, 0.0);
                         state.recorder_active = true;
                         params.control.set_status(TrainerStatus::Armed);
                     }
@@ -605,7 +594,6 @@ impl PluginLogic for MotTrainer {
                         state.recorder_active = false;
                         state.pending_training = Some(TrainRecordingTask {
                             recording,
-                            source_send_trim_db: state.latched_source_send_trim_db,
                             generation: params.control.begin_training_generation(),
                         });
                     }
@@ -617,10 +605,6 @@ impl PluginLogic for MotTrainer {
         context.set_meter(P::CaptureProgress, params.control.capture_progress());
         context.set_meter(P::ReturnPeak, params.control.return_peak());
         context.set_meter(P::TrainingProgress, params.control.training_progress());
-        context.set_meter(
-            P::LatchedSourceTrim,
-            ((state.latched_source_send_trim_db + 40.0) / 40.0).clamp(0.0, 1.0),
-        );
         ProcessStatus::Normal
     }
 
@@ -735,17 +719,13 @@ fn status_from_capture(state: SplitCaptureState) -> TrainerStatus {
     }
 }
 
-fn metadata_from_params(
-    params: &MotTrainerParams,
-    source_send_trim_db: f32,
-) -> HardwareCaptureMetadata {
+fn metadata_from_params(params: &MotTrainerParams) -> HardwareCaptureMetadata {
     let mut metadata = HardwareCaptureMetadata::uncalibrated_full_amp();
     metadata.target = if params.target.value_i32() == 1 {
         CaptureTarget::FullAmpUnfilteredLoad
     } else {
         CaptureTarget::SoftwarePluginChain
     };
-    metadata.source_send_trim_db = source_send_trim_db;
     metadata.excitation_hash = CAPTURE_ASSET_SHA256.to_owned();
     metadata.amplifier = read_lock_string(&params.amplifier);
     metadata.amplifier_channel = read_lock_string(&params.amplifier_channel);
@@ -765,7 +745,6 @@ fn train_and_publish(
     control: &TrainerControl,
     generation: u64,
     recording: CompletedTrainerRecording,
-    source_send_trim_db: f32,
     max_epochs: u32,
     display_name: &str,
     mut capture_metadata: HardwareCaptureMetadata,
@@ -808,12 +787,7 @@ fn train_and_publish(
     ensure_training_active(control, generation, Some(&capture_dir))?;
     let target = extract_aligned_excitation(&program, recording.audio(), alignment)
         .map_err(|error| error.to_string())?;
-    let send_gain = 10.0_f32.powf(source_send_trim_db.clamp(-40.0, 0.0) / 20.0);
-    let emitted: Vec<f32> = program
-        .excitation()
-        .iter()
-        .map(|sample| sample * send_gain)
-        .collect();
+    let emitted = program.excitation().to_vec();
     write_mono_f32_wav(
         &capture_dir.join("emitted.wav"),
         CAPTURE_SAMPLE_RATE_HZ,
@@ -986,10 +960,6 @@ fn capture_record_json(
             return Err(format!("capture record field {name} is not finite"));
         }
     }
-    if !metadata.source_send_trim_db.is_finite() {
-        return Err("capture record field source_send_trim_db is not finite".to_owned());
-    }
-
     let target = match metadata.target {
         CaptureTarget::SoftwarePluginChain => "software_plugin_chain",
         CaptureTarget::FullAmpUnfilteredLoad => "full_amp_unfiltered_load",
@@ -1019,13 +989,12 @@ fn capture_record_json(
     let json = format!(
         concat!(
             "{{\n",
-            "  \"schema_version\": 4,\n",
+            "  \"schema_version\": 5,\n",
             "  \"capture_protocol_version\": {},\n",
             "  \"model_id\": {},\n",
             "  \"created_unix_seconds\": {},\n",
             "  \"target\": \"{}\",\n",
             "  \"sample_rate_hz\": {},\n",
-            "  \"source_send_trim_db\": {:.3},\n",
             "  \"fractional_latency_samples\": {:.8},\n",
             "  \"sync_correlation\": {:.8},\n",
             "  \"return_peak_dbfs\": {},\n",
@@ -1068,7 +1037,6 @@ fn capture_record_json(
         timestamp,
         target,
         metadata.sample_rate_hz,
-        metadata.source_send_trim_db,
         latency_samples,
         correlation,
         return_peak_dbfs,
@@ -1192,8 +1160,22 @@ mod tests {
         let params = MotTrainerParams::new();
         assert_eq!(params.target.value_i32(), 0);
         assert_eq!(params.max_epochs.value_i32(), 400);
-        assert_eq!(params.source_send_trim_db.value(), 0.0);
         assert_eq!(params.control.status(), TrainerStatus::Loading);
+        assert!(
+            params
+                .param_infos()
+                .iter()
+                .all(|info| info.name != "Source Send Trim")
+        );
+        assert_eq!(params.meter_ids().len(), 3);
+    }
+
+    #[test]
+    fn emitted_and_training_input_use_the_canonical_unity_excitation() {
+        let program = test_program();
+        let emitted = program.excitation().to_vec();
+
+        assert_eq!(emitted, program.excitation());
     }
 
     #[test]
@@ -1345,7 +1327,6 @@ mod tests {
     #[test]
     fn capture_record_contains_full_metadata_and_training_outcome() {
         let mut metadata = HardwareCaptureMetadata::uncalibrated_full_amp();
-        metadata.source_send_trim_db = -12.5;
         metadata.return_peak_dbfs = Some(-2.25);
         metadata.return_rms_dbfs = Some(-18.75);
         metadata.excitation_hash = "asset-hash".to_owned();
@@ -1381,8 +1362,8 @@ mod tests {
             .unwrap();
 
         for expected in [
-            "\"schema_version\": 4",
-            "\"capture_protocol_version\": 1",
+            "\"schema_version\": 5",
+            "\"capture_protocol_version\": 2",
             "\"model_id\": \"capture-\\\"id\"",
             "\"target\": \"full_amp_unfiltered_load\"",
             "\"input_level_dbu\": null",
@@ -1410,6 +1391,7 @@ mod tests {
         ] {
             assert!(json.contains(expected), "missing {expected} in:\n{json}");
         }
+        assert!(!json.contains("source_send_trim_db"));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 mod editor;
 
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use crossbeam_queue::ArrayQueue;
@@ -16,7 +16,7 @@ use truce_egui::EguiEditor;
 
 use editor::{GeneratorUi, WINDOW_SIZE};
 
-pub const VERSION: &str = "0.4.6";
+pub const VERSION: &str = "0.4.7";
 const READY_CAPACITY: usize = 2;
 const RETIRED_CAPACITY: usize = 4;
 
@@ -130,20 +130,10 @@ impl AssetControl {
 
 #[derive(Params)]
 pub struct GeneratorParams {
-    #[param(
-        name = "Send Trim",
-        range = "linear(-40, 0)",
-        default = 0,
-        flags = "automatable"
-    )]
-    pub send_trim: FloatParam,
-
     #[skip]
     pub arm_command: AtomicU64,
     #[skip]
     pub arm_transport_was_playing: AtomicBool,
-    #[skip]
-    pub arm_send_trim_bits: AtomicU32,
     #[skip]
     pub asset_control: Arc<AssetControl>,
 
@@ -151,8 +141,6 @@ pub struct GeneratorParams {
     pub status: MeterSlot,
     #[meter]
     pub progress: MeterSlot,
-    #[meter]
-    pub exact_send_trim: MeterSlot,
 }
 
 pub(crate) use GeneratorParamsParamId as P;
@@ -161,7 +149,6 @@ pub(crate) use GeneratorParamsParamId as P;
 struct PrepareGeneratorTask {
     generation: u64,
     sample_rate_hz: u32,
-    send_trim_db: f32,
 }
 
 impl BackgroundTask for PrepareGeneratorTask {
@@ -180,8 +167,7 @@ impl BackgroundTask for PrepareGeneratorTask {
                 ));
             }
             let program = load_default_capture_program()?;
-            let send_gain = db_to_gain(self.send_trim_db);
-            let engine = GeneratorEngine::new(program, self.sample_rate_hz, send_gain)
+            let engine = GeneratorEngine::new(program, self.sample_rate_hz)
                 .map_err(|error| error.to_string())?;
             Ok(PreparedGenerator {
                 generation: self.generation,
@@ -205,7 +191,6 @@ pub struct MotGenerator {
     arm_latched: bool,
     pending_arm: bool,
     interrupted: bool,
-    exact_send_trim_db: f32,
 }
 
 impl Default for MotGenerator {
@@ -220,7 +205,6 @@ impl Default for MotGenerator {
             arm_latched: false,
             pending_arm: false,
             interrupted: false,
-            exact_send_trim_db: 0.0,
         }
     }
 }
@@ -255,9 +239,6 @@ impl MotGenerator {
             if self.pending_arm
                 && let Some(prepared) = &mut self.prepared
             {
-                let _ = prepared
-                    .engine
-                    .set_send_gain_linear(db_to_gain(self.exact_send_trim_db));
                 prepared
                     .engine
                     .arm(params.arm_transport_was_playing.load(Ordering::Acquire));
@@ -267,7 +248,7 @@ impl MotGenerator {
     }
 
     #[inline]
-    fn schedule_load(&mut self, params: &GeneratorParams, context: &ProcessContext) {
+    fn schedule_load(&mut self, context: &ProcessContext) {
         if self.sample_rate_hz != CAPTURE_SAMPLE_RATE_HZ
             || self.prepared.is_some()
             || self.scheduled_generation == self.load_generation
@@ -280,7 +261,6 @@ impl MotGenerator {
         let task = PrepareGeneratorTask {
             generation: self.load_generation,
             sample_rate_hz: self.sample_rate_hz,
-            send_trim_db: params.send_trim.value(),
         };
         if spawner.try_spawn(task).is_ok() {
             self.scheduled_generation = self.load_generation;
@@ -298,13 +278,8 @@ impl MotGenerator {
         self.arm_latched = requested;
         if requested {
             self.interrupted = false;
-            self.exact_send_trim_db =
-                f32::from_bits(params.arm_send_trim_bits.load(Ordering::Acquire)).clamp(-40.0, 0.0);
             let transport_was_playing = params.arm_transport_was_playing.load(Ordering::Acquire);
             if let Some(prepared) = &mut self.prepared {
-                let _ = prepared
-                    .engine
-                    .set_send_gain_linear(db_to_gain(self.exact_send_trim_db));
                 prepared.engine.arm(transport_was_playing);
                 self.pending_arm = false;
             } else {
@@ -404,13 +379,7 @@ impl PluginLogic for MotGenerator {
             state.arm_latched = arm_requested;
             state.interrupted = capture_was_interrupted && !arm_requested;
             if arm_requested {
-                state.exact_send_trim_db =
-                    f32::from_bits(params.arm_send_trim_bits.load(Ordering::Acquire))
-                        .clamp(-40.0, 0.0);
                 if let Some(prepared) = &mut state.prepared {
-                    let _ = prepared
-                        .engine
-                        .set_send_gain_linear(db_to_gain(state.exact_send_trim_db));
                     prepared
                         .engine
                         .arm(params.arm_transport_was_playing.load(Ordering::Acquire));
@@ -433,7 +402,7 @@ impl PluginLogic for MotGenerator {
         context: &mut ProcessContext,
     ) -> ProcessStatus {
         state.poll_prepared(params);
-        state.schedule_load(params, context);
+        state.schedule_load(context);
         state.observe_arm_request(params);
 
         let samples = buffer.num_samples();
@@ -461,10 +430,6 @@ impl PluginLogic for MotGenerator {
         let (status, progress) = generator_meter_state(state, samples);
         context.set_meter(P::Status, f32::from(status) / 7.0);
         context.set_meter(P::Progress, progress);
-        context.set_meter(
-            P::ExactSendTrim,
-            ((state.exact_send_trim_db + 40.0) / 40.0).clamp(0.0, 1.0),
-        );
         ProcessStatus::Normal
     }
 
@@ -507,10 +472,6 @@ pub(crate) fn generator_can_arm(load_status: AssetLoadStatus, normalized_status:
     }
     let status = (normalized_status.clamp(0.0, 1.0) * 7.0).round() as u8;
     matches!(status, 0 | 1 | 6 | 7)
-}
-
-fn db_to_gain(db: f32) -> f32 {
-    10.0_f32.powf(db.clamp(-40.0, 0.0) / 20.0)
 }
 
 #[inline]
@@ -585,15 +546,11 @@ mod tests {
         params
             .arm_transport_was_playing
             .store(false, Ordering::Release);
-        params
-            .arm_send_trim_bits
-            .store((-6.0_f32).to_bits(), Ordering::Release);
         params.arm_command.fetch_add(1, Ordering::AcqRel);
 
         let engine = GeneratorEngine::new(
             load_default_capture_program().unwrap(),
             CAPTURE_SAMPLE_RATE_HZ,
-            1.0,
         )
         .unwrap();
         let mut state = MotGenerator {
@@ -661,15 +618,11 @@ mod tests {
         params
             .arm_transport_was_playing
             .store(false, Ordering::Release);
-        params
-            .arm_send_trim_bits
-            .store((-3.0_f32).to_bits(), Ordering::Release);
         params.arm_command.fetch_add(1, Ordering::AcqRel);
 
         let engine = GeneratorEngine::new(
             load_default_capture_program().unwrap(),
             CAPTURE_SAMPLE_RATE_HZ,
-            1.0,
         )
         .unwrap();
         let mut state = MotGenerator {

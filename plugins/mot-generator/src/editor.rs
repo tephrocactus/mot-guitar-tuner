@@ -73,29 +73,6 @@ impl EditorUi<GeneratorParams> for GeneratorUi {
                         });
 
                         ui.add_space(VERTICAL_GAP);
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new("SEND TRIM").color(text_dim));
-                            let mut send_trim = context.send_trim.value();
-                            let response = ui.add(
-                                egui::Slider::new(&mut send_trim, -40.0..=0.0)
-                                    .step_by(0.1)
-                                    .suffix(" dB"),
-                            );
-                            if response.drag_started() {
-                                context.begin_edit(P::SendTrim);
-                            }
-                            if response.changed() {
-                                context.set_param(
-                                    P::SendTrim,
-                                    f64::from(((send_trim + 40.0) / 40.0).clamp(0.0, 1.0)),
-                                );
-                            }
-                            if response.drag_stopped() {
-                                context.end_edit(P::SendTrim);
-                            }
-                        });
-
-                        ui.add_space(VERTICAL_GAP);
                         let normalized_status = context.get_meter(P::Status);
                         let ready = generator_can_arm(load_status, normalized_status);
                         let arm_command = context.arm_command.load(Ordering::Acquire);
@@ -130,10 +107,6 @@ impl EditorUi<GeneratorParams> for GeneratorUi {
                                 context
                                     .arm_transport_was_playing
                                     .store(transport_was_playing, Ordering::Release);
-                                context.arm_send_trim_bits.store(
-                                    context.send_trim.value().clamp(-40.0, 0.0).to_bits(),
-                                    Ordering::Release,
-                                );
                             }
                             context.arm_command.fetch_add(1, Ordering::AcqRel);
                         }

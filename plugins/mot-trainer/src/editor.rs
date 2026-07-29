@@ -459,10 +459,7 @@ fn training_details_visible(status: TrainerStatus, training: &TrainingSnapshot) 
 }
 
 fn training_detail_text(training: &TrainingSnapshot) -> String {
-    let mut parts = Vec::with_capacity(4);
-    if !training.device.is_empty() {
-        parts.push(training.device.clone());
-    }
+    let mut parts = Vec::with_capacity(3);
     parts.push(format!(
         "elapsed {}",
         format_duration(training.elapsed_seconds)
@@ -618,6 +615,7 @@ mod tests {
             maximum_epochs: 100,
             elapsed_seconds: 135.0,
             epoch_seconds: 33.0,
+            device: "METAL".to_owned(),
             ..TrainingSnapshot::default()
         };
         assert_eq!(

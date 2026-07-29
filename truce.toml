@@ -5,7 +5,7 @@ url = "https://plutandmot.local"
 au_manufacturer = "PMot"
 
 [[plugin]]
-name = "MOT Strobe"
+name = "MOT Guitar Plugin"
 bundle_id = "mot-strobe"
 crate = "mot-strobe"
 category = "effect"
@@ -17,4 +17,4 @@ au_tag = "Effects"
 # "Reverb", "Surround", "Analyzer", "Spatial". Leave as "Tools" for
 # generic utilities. Without this, Cubase buckets the plugin under
 # "Other".
-vst3_subcategory = "Analyzer"
+vst3_subcategory = "Distortion"

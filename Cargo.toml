@@ -1,6 +1,6 @@
 [package]
 name = "mot-strobe"
-version = "0.2.3"
+version = "0.3.0"
 edition = "2024"
 
 [lib]
@@ -32,6 +32,8 @@ truce-egui = { version = "6.3" }
 truce-vst3 = { version = "6.3", optional = true }
 truce-standalone = { version = "6.3", features = ["gui"], optional = true }
 egui = "0.34"
+crossbeam-queue = "0.3"
+rfd = { version = "0.15", default-features = false }
 
 [profile.release]
 opt-level = 3

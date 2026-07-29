@@ -5,7 +5,7 @@ use mot_core::tuner::STRING_COUNT;
 use truce::prelude::*;
 use truce_egui::EditorUi;
 
-use crate::{MotTunerParams, P, notes, offsets, round_to_tenth};
+use crate::{MotTunerParams, P, VERSION, notes, offsets, round_to_tenth};
 
 pub(crate) const WINDOW_SIZE: (u32, u32) = (900, 720);
 const OFFSET_MIN: f32 = -25.0;
@@ -46,14 +46,9 @@ fn header(
     text_dim: Color32,
 ) {
     ui.horizontal(|ui| {
+        ui.label(RichText::new("MOT TUNER").size(27.0).color(accent));
         ui.label(
-            RichText::new("MOT TUNER")
-                .font(FontId::proportional(24.0))
-                .strong()
-                .color(accent),
-        );
-        ui.label(
-            RichText::new("0.4.0  •  MONO  •  ZERO LATENCY")
+            RichText::new(format!("{VERSION}  •  MONO  •  48 kHz"))
                 .monospace()
                 .color(text_dim),
         );

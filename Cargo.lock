@@ -1565,7 +1565,7 @@ dependencies = [
 
 [[package]]
 name = "mot-tuner"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "egui",
  "mot-core",

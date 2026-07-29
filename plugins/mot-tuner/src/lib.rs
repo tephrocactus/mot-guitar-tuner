@@ -8,6 +8,8 @@ use truce_egui::EguiEditor;
 
 use editor::{MotTunerUi, WINDOW_SIZE};
 
+pub const VERSION: &str = "0.4.1";
+
 #[derive(Params)]
 pub struct MotTunerParams {
     #[param(name = "Bypass", flags = "automatable | bypass")]

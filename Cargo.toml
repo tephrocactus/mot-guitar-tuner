@@ -10,6 +10,7 @@ crate-type = ["rlib"]
 
 [workspace]
 members = [
+    "plugins/mot-ui",
     "plugins/mot-generator",
     "plugins/mot-trainer",
     "plugins/mot-player",

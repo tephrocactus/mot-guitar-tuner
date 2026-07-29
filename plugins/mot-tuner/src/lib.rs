@@ -8,7 +8,7 @@ use truce_egui::EguiEditor;
 
 use editor::{MotTunerUi, WINDOW_SIZE};
 
-pub const VERSION: &str = "0.4.1";
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Params)]
 pub struct MotTunerParams {

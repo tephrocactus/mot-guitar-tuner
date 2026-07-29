@@ -1528,11 +1528,12 @@ dependencies = [
 
 [[package]]
 name = "mot-generator"
-version = "0.4.7"
+version = "0.5.0"
 dependencies = [
  "crossbeam-queue",
  "egui",
  "mot-core",
+ "mot-ui",
  "truce",
  "truce-egui",
  "truce-vst3",
@@ -1540,11 +1541,12 @@ dependencies = [
 
 [[package]]
 name = "mot-player"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "crossbeam-queue",
  "egui",
  "mot-core",
+ "mot-ui",
  "rfd",
  "truce",
  "truce-egui",
@@ -1553,11 +1555,12 @@ dependencies = [
 
 [[package]]
 name = "mot-trainer"
-version = "0.4.6"
+version = "0.5.0"
 dependencies = [
  "crossbeam-queue",
  "egui",
  "mot-core",
+ "mot-ui",
  "truce",
  "truce-egui",
  "truce-vst3",
@@ -1565,13 +1568,21 @@ dependencies = [
 
 [[package]]
 name = "mot-tuner"
-version = "0.4.1"
+version = "0.5.0"
 dependencies = [
  "egui",
  "mot-core",
+ "mot-ui",
  "truce",
  "truce-egui",
  "truce-vst3",
+]
+
+[[package]]
+name = "mot-ui"
+version = "0.1.0"
+dependencies = [
+ "egui",
 ]
 
 [[package]]

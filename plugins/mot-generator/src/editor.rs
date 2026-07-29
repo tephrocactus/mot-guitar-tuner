@@ -1,7 +1,7 @@
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use egui::{Color32, RichText, Stroke};
+use egui::{Align, Color32, Layout, RichText};
 use truce::prelude::*;
 use truce_egui::EditorUi;
 
@@ -10,9 +10,6 @@ use crate::{
 };
 
 pub(crate) const WINDOW_SIZE: (u32, u32) = (720, 320);
-const EDITOR_MARGIN: f32 = 22.0;
-const PANEL_MARGIN: f32 = 20.0;
-const VERTICAL_GAP: f32 = 16.0;
 
 pub(crate) struct GeneratorUi;
 
@@ -20,135 +17,117 @@ impl EditorUi<GeneratorParams> for GeneratorUi {
     fn ui(&mut self, ui: &mut egui::Ui, context: &PluginContext<GeneratorParams>) {
         ui.ctx().request_repaint_after(Duration::from_millis(33));
 
-        let background = Color32::from_rgb(10, 12, 14);
-        let panel = Color32::from_rgb(20, 24, 28);
-        let cyan = Color32::from_rgb(58, 220, 210);
-        let text = Color32::from_rgb(228, 235, 238);
-        let text_dim = Color32::from_rgb(135, 148, 155);
-        ui.visuals_mut().panel_fill = background;
-        ui.visuals_mut().override_text_color = Some(text);
+        mot_ui::apply(ui);
         let editor_rect = ui.max_rect();
-        let content_width = (editor_rect.width() - EDITOR_MARGIN * 2.0).max(0.0);
-        ui.painter().rect_filled(editor_rect, 0.0, background);
+        let content_width = (editor_rect.width() - mot_ui::OUTER_MARGIN * 2.0).max(0.0);
+        ui.painter()
+            .rect_filled(editor_rect, 0.0, mot_ui::BACKGROUND);
 
-        egui::Frame::new()
-            .fill(background)
-            .inner_margin(EDITOR_MARGIN)
-            .show(ui, |ui| {
-                ui.set_min_width(content_width);
+        mot_ui::background_frame().show(ui, |ui| {
+            ui.set_min_width(content_width);
+            mot_ui::header(ui, "MOT GENERATOR", VERSION, false, |_| {});
+
+            let load_status = context.asset_control.status();
+            let (status_label, status_color) = status_label(context, load_status);
+            let normalized_status = context.get_meter(P::Status);
+            let ready = generator_can_arm(load_status, normalized_status);
+            let arm_command = context.arm_command.load(Ordering::Acquire);
+            let armed = arm_command_is_active(arm_command);
+            let status_code = (normalized_status.clamp(0.0, 1.0) * 7.0).round() as u8;
+            let capture_running = matches!(status_code, 3..=5);
+
+            let panel_height = ui.available_height();
+            mot_ui::panel().show(ui, |ui| {
+                ui.set_min_width(
+                    (content_width - mot_ui::PANEL_MARGIN * 2.0).max(0.0),
+                );
+                ui.set_min_height(
+                    (panel_height - mot_ui::PANEL_MARGIN * 2.0).max(0.0),
+                );
+
                 ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new("MOT GENERATOR")
-                            .size(27.0)
-                            .color(cyan),
-                    );
-                    ui.label(
-                        RichText::new(format!("{VERSION}  •  MONO  •  48 kHz"))
-                            .monospace()
-                            .color(text_dim),
-                    );
-                });
-                ui.add_space(VERTICAL_GAP);
-                let panel_height = ui.available_height();
+                    ui.vertical(|ui| {
+                        ui.label(mot_ui::field_label("STATUS"));
+                        ui.add_space(4.0);
+                        ui.label(mot_ui::status_text(status_label, status_color));
+                    });
 
-                egui::Frame::new()
-                    .fill(panel)
-                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(44, 52, 58)))
-                    .corner_radius(10.0)
-                    .inner_margin(PANEL_MARGIN)
-                    .show(ui, |ui| {
-                        ui.set_min_width((content_width - PANEL_MARGIN * 2.0).max(0.0));
-                        ui.set_min_height((panel_height - PANEL_MARGIN * 2.0).max(0.0));
-                        let load_status = context.asset_control.status();
-                        let (status_label, status_color) =
-                            status_label(context, load_status, cyan, text_dim);
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new("STATUS").color(text_dim));
-                            ui.label(
-                                RichText::new(status_label)
-                                    .strong()
-                                    .monospace()
-                                    .color(status_color),
-                            );
-                        });
-
-                        ui.add_space(VERTICAL_GAP);
-                        let normalized_status = context.get_meter(P::Status);
-                        let ready = generator_can_arm(load_status, normalized_status);
-                        let arm_command = context.arm_command.load(Ordering::Acquire);
-                        let armed = arm_command_is_active(arm_command);
-                        let status_code =
-                            (normalized_status.clamp(0.0, 1.0) * 7.0).round() as u8;
-                        let capture_running = matches!(status_code, 3..=5);
-                        let arm_text_color = if armed { background } else { text };
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         let arm_label = if armed { "ARMED" } else { "ARM" };
-                        let mut arm_button = egui::Button::new((
-                            egui::Atom::grow(),
-                            RichText::new(arm_label)
-                                .strong()
-                                .size(16.0)
-                                .color(arm_text_color),
-                            egui::Atom::grow(),
-                        ))
-                        .min_size(egui::vec2(86.0, 36.0));
-                        if armed {
-                            arm_button = arm_button
-                                .fill(cyan)
-                                .stroke(Stroke::new(1.0_f32, cyan));
+                        let label_color = if armed {
+                            mot_ui::BACKGROUND
+                        } else {
+                            mot_ui::TEXT
+                        };
+                        let label = RichText::new(arm_label)
+                            .strong()
+                            .size(15.0)
+                            .color(label_color);
+                        let button = if armed {
+                            mot_ui::accent_button(label)
+                        } else {
+                            mot_ui::ghost_button(label)
                         }
+                        .min_size(egui::vec2(110.0, 40.0));
                         let arm = ui.add_enabled(
                             if armed { !capture_running } else { ready },
-                            arm_button,
+                            button,
                         );
                         if arm.clicked() {
                             if !armed {
-                                let transport_was_playing =
-                                    context.transport().is_some_and(|transport| transport.playing);
+                                let transport_was_playing = context
+                                    .transport()
+                                    .is_some_and(|transport| transport.playing);
                                 context
                                     .arm_transport_was_playing
                                     .store(transport_was_playing, Ordering::Release);
                             }
                             context.arm_command.fetch_add(1, Ordering::AcqRel);
                         }
-                        if armed && matches!(status_code, 0..=2) {
-                            ui.add_space(VERTICAL_GAP);
-                            ui.label(
-                                RichText::new(
-                                    "Now click Play in a DAW's transport panel. Stop playback if already playing",
-                                )
-                                .color(text_dim),
-                            );
-                        }
-
-                        if armed {
-                            ui.add_space(VERTICAL_GAP);
-                            let progress = context.get_meter(P::Progress).clamp(0.0, 1.0);
-                            ui.add(egui::ProgressBar::new(progress).show_percentage());
-                        }
                     });
+                });
+
+                if armed && matches!(status_code, 0..=2) {
+                    ui.add_space(mot_ui::ROW_GAP);
+                    ui.label(
+                        RichText::new(
+                            "Now click Play in a DAW's transport panel. Stop playback if already playing",
+                        )
+                        .color(mot_ui::DIM),
+                    );
+                }
+
+                if armed {
+                    ui.add_space(mot_ui::ROW_GAP);
+                    let progress = context.get_meter(P::Progress).clamp(0.0, 1.0);
+                    mot_ui::progress(
+                        ui,
+                        progress,
+                        format!("{:.0}%", progress * 100.0),
+                    );
+                }
             });
+        });
     }
 }
 
 fn status_label(
     context: &PluginContext<GeneratorParams>,
     load_status: AssetLoadStatus,
-    accent: Color32,
-    text_dim: Color32,
 ) -> (&'static str, Color32) {
     if load_status == AssetLoadStatus::Error {
-        return ("Interrupted", Color32::from_rgb(255, 112, 100));
+        return ("Interrupted", mot_ui::ERROR);
     }
     if load_status == AssetLoadStatus::Loading {
-        return ("Ready", text_dim);
+        return ("Ready", mot_ui::DIM);
     }
 
     let status = (context.get_meter(P::Status).clamp(0.0, 1.0) * 7.0).round() as u8;
     match status {
-        2 => ("Waiting For Play", Color32::from_rgb(255, 196, 74)),
-        3 => ("Preroll", Color32::from_rgb(255, 196, 74)),
-        4 | 5 => ("Playing Capture wav", accent),
-        7 => ("Interrupted", Color32::from_rgb(255, 112, 100)),
-        _ => ("Ready", accent),
+        2 => ("Waiting For Play", mot_ui::WAITING),
+        3 => ("Preroll", mot_ui::WAITING),
+        4 | 5 => ("Playing Capture wav", mot_ui::ACCENT),
+        7 => ("Interrupted", mot_ui::ERROR),
+        _ => ("Ready", mot_ui::ACCENT),
     }
 }

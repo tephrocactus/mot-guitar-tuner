@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use egui::{Align, Align2, Color32, FontId, Layout, RichText, Sense, Stroke, StrokeKind, Vec2};
+use egui::{Align2, Color32, FontId, RichText, Sense, Stroke, StrokeKind, Vec2};
 use mot_core::tuner::STRING_COUNT;
 use truce::prelude::*;
 use truce_egui::EditorUi;
@@ -16,66 +16,41 @@ pub(crate) struct MotTunerUi;
 impl EditorUi<MotTunerParams> for MotTunerUi {
     fn ui(&mut self, ui: &mut egui::Ui, context: &PluginContext<MotTunerParams>) {
         ui.ctx().request_repaint_after(Duration::from_millis(16));
+        mot_ui::apply(ui);
+        ui.painter()
+            .rect_filled(ui.max_rect(), 0.0, mot_ui::BACKGROUND);
 
-        let background = Color32::from_rgb(10, 12, 14);
-        let panel = Color32::from_rgb(20, 24, 28);
-        let accent = Color32::from_rgb(58, 220, 210);
-        let text_dim = Color32::from_rgb(135, 148, 155);
-        ui.visuals_mut().panel_fill = background;
-        ui.visuals_mut().override_text_color = Some(Color32::from_rgb(228, 235, 238));
-
-        egui::Frame::new()
-            .fill(background)
-            .inner_margin(18.0)
-            .show(ui, |ui| {
-                header(ui, context, accent, text_dim);
-                ui.add_space(12.0);
-                ui.separator();
-                ui.add_space(12.0);
-                strobe(ui, context, panel, accent);
-                ui.add_space(10.0);
-                string_editor(ui, context, panel, accent, text_dim);
+        mot_ui::background_frame().show(ui, |ui| {
+            mot_ui::header(ui, "MOT TUNER", VERSION, false, |ui| {
+                let muted = context.mute.value();
+                let button = if muted {
+                    egui::Button::new(RichText::new("MUTE").color(mot_ui::BACKGROUND))
+                        .fill(mot_ui::ERROR)
+                        .stroke(Stroke::NONE)
+                        .corner_radius(mot_ui::CONTROL_RADIUS)
+                } else {
+                    mot_ui::ghost_button("MUTE")
+                };
+                if ui.add(button).clicked() {
+                    context.automate(P::Mute, if muted { 0.0 } else { 1.0 });
+                }
             });
+
+            let table_height = 250.0;
+            let strobe_height =
+                (ui.available_height() - table_height - mot_ui::SECTION_GAP).max(280.0);
+            strobe(ui, context, strobe_height);
+            ui.add_space(mot_ui::SECTION_GAP);
+            string_editor(ui, context);
+        });
     }
 }
 
-fn header(
-    ui: &mut egui::Ui,
-    context: &PluginContext<MotTunerParams>,
-    accent: Color32,
-    text_dim: Color32,
-) {
-    ui.horizontal(|ui| {
-        ui.label(RichText::new("MOT TUNER").size(27.0).color(accent));
-        ui.label(
-            RichText::new(format!("{VERSION}  •  MONO  •  48 kHz"))
-                .monospace()
-                .color(text_dim),
-        );
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            let muted = context.mute.value();
-            let button = egui::Button::new("MUTE").fill(if muted {
-                Color32::from_rgb(146, 48, 55)
-            } else {
-                Color32::from_rgb(42, 48, 52)
-            });
-            if ui.add(button).clicked() {
-                context.automate(P::Mute, if muted { 0.0 } else { 1.0 });
-            }
-        });
-    });
-}
-
-fn strobe(
-    ui: &mut egui::Ui,
-    context: &PluginContext<MotTunerParams>,
-    panel: Color32,
-    accent: Color32,
-) {
-    let desired = Vec2::new(ui.available_width(), 300.0);
+fn strobe(ui: &mut egui::Ui, context: &PluginContext<MotTunerParams>, height: f32) {
+    let desired = Vec2::new(ui.available_width(), height);
     let (rect, _) = ui.allocate_exact_size(desired, Sense::hover());
     let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 10.0, panel);
+    painter.rect_filled(rect, mot_ui::PANEL_RADIUS, mot_ui::SURFACE);
 
     let detected = decode_note(context.get_meter(P::DetectedNote));
     let cents = (context.get_meter(P::Cents) - 0.5) * 100.0;
@@ -85,23 +60,16 @@ fn strobe(
     let stripe_width = period * 0.5;
     let offset = phase * period;
 
-    let bright = if active {
-        accent
-    } else {
-        Color32::from_rgb(45, 65, 66)
-    };
-    let dark = if active {
-        Color32::from_rgb(20, 70, 68)
-    } else {
-        Color32::from_rgb(28, 36, 39)
-    };
+    let bright =
+        mot_ui::strobe_stripe_color(active, true).linear_multiply(if active { 0.42 } else { 1.0 });
+    let dark = mot_ui::strobe_stripe_color(active, false);
 
     let mut x = rect.left() - period + offset;
     let mut alternate = false;
     while x < rect.right() + period {
         let stripe = egui::Rect::from_min_max(
-            egui::pos2(x, rect.top() + 12.0),
-            egui::pos2(x + stripe_width, rect.bottom() - 12.0),
+            egui::pos2(x, rect.top() + mot_ui::PANEL_MARGIN),
+            egui::pos2(x + stripe_width, rect.bottom() - mot_ui::PANEL_MARGIN),
         );
         painter.rect_filled(stripe, 3.0, if alternate { bright } else { dark });
         alternate = !alternate;
@@ -117,14 +85,14 @@ fn strobe(
     );
     painter.rect_stroke(
         rect,
-        10.0,
-        Stroke::new(1.0_f32, Color32::from_rgb(48, 56, 61)),
+        mot_ui::PANEL_RADIUS,
+        Stroke::new(1.0_f32, mot_ui::LINE),
         StrokeKind::Inside,
     );
 
     let circle_center = rect.center();
-    let circle_radius = 78.0;
-    painter.circle_filled(circle_center, circle_radius, Color32::from_white_alpha(215));
+    let circle_radius = height.mul_add(0.24, 0.0).clamp(72.0, 92.0);
+    painter.circle_filled(circle_center, circle_radius, Color32::from_white_alpha(220));
     painter.circle_stroke(
         circle_center,
         circle_radius,
@@ -142,7 +110,7 @@ fn strobe(
         egui::pos2(circle_center.x, circle_center.y - 20.0),
         Align2::CENTER_CENTER,
         note_text,
-        FontId::monospace(46.0),
+        FontId::monospace(48.0),
         ink,
     );
     painter.text(
@@ -154,13 +122,7 @@ fn strobe(
     );
 }
 
-fn string_editor(
-    ui: &mut egui::Ui,
-    context: &PluginContext<MotTunerParams>,
-    panel: Color32,
-    accent: Color32,
-    text_dim: Color32,
-) {
+fn string_editor(ui: &mut egui::Ui, context: &PluginContext<MotTunerParams>) {
     let note_ids = [
         P::String7Note,
         P::String6Note,
@@ -183,93 +145,95 @@ fn string_editor(
     let mut offset_values = offsets(context);
     let matched = decode_string(context.get_meter(P::MatchedString));
 
-    egui::Frame::new()
-        .fill(panel)
-        .corner_radius(8.0)
-        .inner_margin(12.0)
-        .show(ui, |ui| {
-            offset_switch(ui, context, accent, text_dim);
-            ui.add_space(6.0);
-
-            egui::Grid::new("mot_tuner_string_grid")
-                .num_columns(3)
-                .spacing([18.0, 6.0])
-                .striped(true)
-                .show(ui, |ui| {
-                    ui.label(RichText::new("STRING").color(text_dim));
-                    ui.label(RichText::new("REFERENCE NOTE").color(text_dim));
-                    ui.label(RichText::new("OFFSET").color(text_dim));
-                    ui.end_row();
-
-                    for index in 0..STRING_COUNT {
-                        let display_string = 7 - index;
-                        let string_label = RichText::new(display_string.to_string()).strong();
-                        ui.label(if matched == Some(index) {
-                            string_label.color(accent)
-                        } else {
-                            string_label
-                        });
-
-                        ui.horizontal(|ui| {
-                            if ui
-                                .add_enabled(
-                                    note_values[index] > 0,
-                                    egui::Button::new("◀").frame(false),
-                                )
-                                .clicked()
-                            {
-                                let previous = note_values[index] - 1;
-                                context.automate(note_ids[index], f64::from(previous) / 127.0);
-                            }
-                            ui.add_sized(
-                                [50.0, 18.0],
-                                egui::Label::new(
-                                    RichText::new(note_name(note_values[index]))
-                                        .monospace()
-                                        .strong(),
-                                ),
-                            );
-                            if ui
-                                .add_enabled(
-                                    note_values[index] < 127,
-                                    egui::Button::new("▶").frame(false),
-                                )
-                                .clicked()
-                            {
-                                let next = note_values[index] + 1;
-                                context.automate(note_ids[index], f64::from(next) / 127.0);
-                            }
-                        });
-
-                        let response = ui.add(
-                            egui::DragValue::new(&mut offset_values[index])
-                                .range(OFFSET_MIN..=OFFSET_MAX)
-                                .speed(0.1)
-                                .fixed_decimals(1)
-                                .suffix(" c"),
-                        );
-                        if response.changed() {
-                            offset_values[index] = round_to_tenth(offset_values[index]);
-                            let normalized =
-                                (offset_values[index] - OFFSET_MIN) / (OFFSET_MAX - OFFSET_MIN);
-                            context.automate(offset_ids[index], f64::from(normalized));
-                        }
-
-                        ui.end_row();
-                    }
-                });
+    mot_ui::panel().show(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.label(mot_ui::section_label("STRING OFFSETS"));
+            offset_switch(ui, context);
         });
+        ui.add_space(mot_ui::ROW_GAP);
+
+        egui::Grid::new("mot_tuner_string_grid")
+            .num_columns(3)
+            .spacing([28.0, 5.0])
+            .min_col_width(92.0)
+            .show(ui, |ui| {
+                ui.label(mot_ui::field_label("STRING"));
+                ui.label(mot_ui::field_label("REFERENCE NOTE"));
+                ui.label(mot_ui::field_label("OFFSET"));
+                ui.end_row();
+
+                for index in 0..STRING_COUNT {
+                    let display_string = 7 - index;
+                    let is_matched = matched == Some(index);
+                    let string_label = RichText::new(display_string.to_string())
+                        .monospace()
+                        .strong()
+                        .color(if is_matched {
+                            mot_ui::ACCENT
+                        } else {
+                            mot_ui::TEXT
+                        });
+                    ui.label(string_label);
+
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(
+                                note_values[index] > 0,
+                                egui::Button::new("◀").frame(false),
+                            )
+                            .clicked()
+                        {
+                            let previous = note_values[index] - 1;
+                            context.automate(note_ids[index], f64::from(previous) / 127.0);
+                        }
+                        ui.add_sized(
+                            [54.0, 18.0],
+                            egui::Label::new(
+                                RichText::new(note_name(note_values[index]))
+                                    .monospace()
+                                    .strong()
+                                    .color(if is_matched {
+                                        mot_ui::ACCENT
+                                    } else {
+                                        mot_ui::TEXT
+                                    }),
+                            ),
+                        );
+                        if ui
+                            .add_enabled(
+                                note_values[index] < 127,
+                                egui::Button::new("▶").frame(false),
+                            )
+                            .clicked()
+                        {
+                            let next = note_values[index] + 1;
+                            context.automate(note_ids[index], f64::from(next) / 127.0);
+                        }
+                    });
+
+                    let response = ui.add(
+                        egui::DragValue::new(&mut offset_values[index])
+                            .range(OFFSET_MIN..=OFFSET_MAX)
+                            .speed(0.1)
+                            .fixed_decimals(1)
+                            .suffix(" c"),
+                    );
+                    if response.changed() {
+                        offset_values[index] = round_to_tenth(offset_values[index]);
+                        let normalized =
+                            (offset_values[index] - OFFSET_MIN) / (OFFSET_MAX - OFFSET_MIN);
+                        context.automate(offset_ids[index], f64::from(normalized));
+                    }
+
+                    ui.end_row();
+                }
+            });
+    });
 }
 
-fn offset_switch(
-    ui: &mut egui::Ui,
-    context: &PluginContext<MotTunerParams>,
-    accent: Color32,
-    text_dim: Color32,
-) {
+fn offset_switch(ui: &mut egui::Ui, context: &PluginContext<MotTunerParams>) {
     let enabled = context.offsets_enabled.value();
     ui.horizontal(|ui| {
-        ui.label(RichText::new("OFFSETS").strong().color(text_dim));
         let (rect, response) = ui.allocate_exact_size(Vec2::new(46.0, 24.0), Sense::click());
         if response.clicked() {
             context.automate(P::OffsetsEnabled, if enabled { 0.0 } else { 1.0 });
@@ -279,7 +243,7 @@ fn offset_switch(
         let track_color = if enabled {
             Color32::from_rgb(31, 107, 100)
         } else {
-            Color32::from_rgb(52, 58, 62)
+            mot_ui::LINE
         };
         ui.painter()
             .rect_filled(rect, rect.height() / 2.0, track_color);
@@ -291,16 +255,12 @@ fn offset_switch(
         ui.painter().circle_filled(
             egui::pos2(knob_x, rect.center().y),
             8.5,
-            if enabled {
-                accent
-            } else {
-                Color32::from_rgb(172, 180, 184)
-            },
+            if enabled { mot_ui::ACCENT } else { mot_ui::DIM },
         );
         ui.label(
             RichText::new(if enabled { "ON" } else { "OFF" })
                 .monospace()
-                .color(if enabled { accent } else { text_dim }),
+                .color(if enabled { mot_ui::ACCENT } else { mot_ui::DIM }),
         );
     });
 }

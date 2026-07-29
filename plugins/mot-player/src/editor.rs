@@ -11,6 +11,11 @@ use mot_core::model_library::{
 use truce::prelude::*;
 use truce_egui::EditorUi;
 
+use mot_ui::{
+    ACCENT, DEEP, DIM, ERROR, KnobSpec, SUCCESS, TEXT, WAITING, accent_button, background_frame,
+    danger_button, field_label, ghost_button, panel, parameter_knob, section_label, status_text,
+};
+
 use crate::{
     ImportIrTask, IrImportOutcome, LibraryOutcome, LibraryTask, LibraryTaskOperation,
     MotPlayerParams, P, RuntimeUiState, read_shared_string, write_shared_string,
@@ -101,34 +106,22 @@ impl EditorUi<MotPlayerParams> for MotPlayerUi {
         poll_ir_import_outcome(&mut state, context);
         service_pending_library_refresh(&mut state, context);
 
-        let background = Color32::from_rgb(10, 12, 14);
-        let panel = Color32::from_rgb(20, 24, 28);
-        let panel_alt = Color32::from_rgb(25, 30, 34);
-        let cyan = Color32::from_rgb(58, 220, 210);
-        let text_dim = Color32::from_rgb(135, 148, 155);
-        ui.visuals_mut().panel_fill = background;
-        ui.visuals_mut().override_text_color = Some(Color32::from_rgb(228, 235, 238));
-
-        egui::Frame::new()
-            .fill(background)
-            .inner_margin(18.0)
-            .show(ui, |ui| {
-                header(ui, context, cyan, text_dim);
-                ui.add_space(12.0);
-                ui.separator();
-                ui.add_space(12.0);
-                ui.horizontal_top(|ui| {
-                    fixed_vertical_panel(ui, Vec2::new(350.0, ui.available_height()), |ui| {
-                        model_browser(ui, context, &mut state, panel, panel_alt, cyan, text_dim);
-                    });
-                    ui.add_space(10.0);
-                    ui.separator();
-                    ui.add_space(10.0);
-                    ui.vertical(|ui| {
-                        player_controls(ui, context, &mut state, panel, panel_alt, cyan, text_dim);
-                    });
+        mot_ui::apply(ui);
+        ui.painter()
+            .rect_filled(ui.max_rect(), 0.0, mot_ui::BACKGROUND);
+        background_frame().show(ui, |ui| {
+            header(ui, context);
+            let content_height = ui.available_height();
+            ui.horizontal_top(|ui| {
+                fixed_vertical_panel(ui, Vec2::new(310.0, content_height), |ui| {
+                    model_browser(ui, context, &mut state);
+                });
+                ui.add_space(6.0);
+                fixed_vertical_panel(ui, Vec2::new(ui.available_width(), content_height), |ui| {
+                    player_controls(ui, context, &mut state);
                 });
             });
+        });
 
         ui.ctx().data_mut(|data| data.insert_temp(state_id, state));
     }
@@ -312,35 +305,17 @@ fn poll_ir_import_outcome(state: &mut EditorState, context: &PluginContext<MotPl
     }
 }
 
-fn header(
-    ui: &mut egui::Ui,
-    context: &PluginContext<MotPlayerParams>,
-    accent: Color32,
-    text_dim: Color32,
-) {
-    ui.horizontal(|ui| {
-        ui.label(
-            RichText::new("MOT PLAYER")
-                .font(FontId::proportional(24.0))
-                .strong()
-                .color(accent),
-        );
-        ui.label(
-            RichText::new("0.4.0  •  MONO  •  48 kHz  •  ZERO LATENCY")
-                .monospace()
-                .color(text_dim),
-        );
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            let muted = context.mute.value();
-            let button = egui::Button::new("MUTE").fill(if muted {
-                Color32::from_rgb(146, 48, 55)
-            } else {
-                Color32::from_rgb(42, 48, 52)
-            });
-            if ui.add(button).clicked() {
-                context.automate(P::Mute, if muted { 0.0 } else { 1.0 });
-            }
-        });
+fn header(ui: &mut egui::Ui, context: &PluginContext<MotPlayerParams>) {
+    mot_ui::header(ui, "MOT PLAYER", env!("CARGO_PKG_VERSION"), true, |ui| {
+        let muted = context.mute.value();
+        let button = if muted {
+            danger_button(RichText::new("MUTE").color(TEXT))
+        } else {
+            ghost_button("MUTE")
+        };
+        if ui.add(button).clicked() {
+            context.automate(P::Mute, if muted { 0.0 } else { 1.0 });
+        }
     });
 }
 
@@ -361,165 +336,159 @@ fn model_browser(
     ui: &mut egui::Ui,
     context: &PluginContext<MotPlayerParams>,
     state: &mut EditorState,
-    panel: Color32,
-    panel_alt: Color32,
-    accent: Color32,
-    text_dim: Color32,
 ) {
-    egui::Frame::new()
-        .fill(panel)
-        .corner_radius(8.0)
-        .inner_margin(12.0)
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("MODELS").strong().color(accent));
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+    let browser_height = ui.available_height();
+    let pending_height = if state.pending_model.is_some() {
+        116.0
+    } else {
+        0.0
+    };
+    panel().show(ui, |ui| {
+        ui.set_min_height((browser_height - mot_ui::PANEL_MARGIN * 2.0 - pending_height).max(0.0));
+        ui.horizontal(|ui| {
+            ui.label(section_label("MODELS"));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.label(
+                    RichText::new(format!("{:02}", state.scan.models.len()))
+                        .monospace()
+                        .color(DIM),
+                );
+            });
+        });
+        ui.add_space(4.0);
+
+        let selected_id = read_shared_string(&context.selected_model_id);
+        let selected_hash = read_shared_string(&context.selected_model_sha256);
+        let models = state.scan.models.clone();
+        let list_height = (ui.available_height() - 104.0).max(180.0);
+        egui::ScrollArea::vertical()
+            .id_salt("mot_player_model_browser")
+            .max_height(list_height)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                if models.is_empty() {
                     ui.label(
-                        RichText::new(state.scan.models.len().to_string())
-                            .monospace()
-                            .color(text_dim),
+                        RichText::new("No compatible .motmodel files")
+                            .italics()
+                            .color(DIM),
                     );
-                });
-            });
-            ui.add_space(6.0);
-
-            let selected_id = read_shared_string(&context.selected_model_id);
-            let selected_hash = read_shared_string(&context.selected_model_sha256);
-            let models = state.scan.models.clone();
-            egui::ScrollArea::vertical()
-                .id_salt("mot_player_model_browser")
-                .max_height(440.0)
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    if models.is_empty() {
-                        ui.label(
-                            RichText::new("No compatible .motmodel files")
-                                .italics()
-                                .color(text_dim),
-                        );
-                        ui.label(
-                            RichText::new(
-                                "~/Library/Application Support/Plut&Mot/MOT Guitar Plugin/Models/",
-                            )
-                            .small()
-                            .monospace()
-                            .color(text_dim),
-                        );
-                    }
-                    for entry in models {
-                        let selected = entry.reference.model_id == selected_id
-                            && entry
-                                .reference
-                                .sha256
-                                .to_string()
-                                .eq_ignore_ascii_case(&selected_hash);
-                        let label = format!(
-                            "{}\n{} • {} MAC/smp",
-                            entry.metadata.display_name,
-                            entry.reference.filename_hint,
-                            entry.metadata.estimated_macs_per_sample
-                        );
-                        let response = ui.add_sized(
-                            [ui.available_width(), 48.0],
-                            egui::Button::new(RichText::new(label).color(if selected {
-                                accent
-                            } else {
-                                Color32::WHITE
-                            }))
-                            .selected(selected)
-                            .fill(if selected {
-                                Color32::from_rgb(26, 70, 68)
-                            } else {
-                                panel_alt
-                            }),
-                        );
-                        if response.clicked() && !selected {
-                            if tone_is_dirty(state, context) {
-                                state.pending_model = Some(entry);
-                            } else {
-                                request_select_model(state, context, entry);
-                            }
+                    ui.label(
+                        RichText::new(
+                            "~/Library/Application Support/Plut&Mot/MOT Guitar Plugin/Models/",
+                        )
+                        .small()
+                        .monospace()
+                        .color(DIM),
+                    );
+                }
+                for entry in models {
+                    let selected = entry.reference.model_id == selected_id
+                        && entry
+                            .reference
+                            .sha256
+                            .to_string()
+                            .eq_ignore_ascii_case(&selected_hash);
+                    let label = format!(
+                        "{}\n{} • {} MAC/smp",
+                        entry.metadata.display_name,
+                        entry.reference.filename_hint,
+                        entry.metadata.estimated_macs_per_sample
+                    );
+                    let label = RichText::new(label).monospace().color(if selected {
+                        ACCENT
+                    } else {
+                        TEXT
+                    });
+                    let button = if selected {
+                        mot_ui::selected_model_button(label)
+                    } else {
+                        ghost_button(label).fill(DEEP)
+                    };
+                    let response = ui.add_sized([ui.available_width(), 54.0], button);
+                    if response.clicked() && !selected {
+                        if tone_is_dirty(state, context) {
+                            state.pending_model = Some(entry);
+                        } else {
+                            request_select_model(state, context, entry);
                         }
                     }
-                });
-
-            ui.add_space(8.0);
-            ui.horizontal_wrapped(|ui| {
-                let busy = context.library_control.is_busy();
-                if ui
-                    .add_enabled(!busy, egui::Button::new("REFRESH").small())
-                    .clicked()
-                {
-                    state.refresh_pending = true;
-                }
-                if ui
-                    .add_enabled(!busy, egui::Button::new("OPEN FOLDER").small())
-                    .clicked()
-                {
-                    match submit_library_task(context, LibraryTaskOperation::OpenFolder) {
-                        Ok(()) => {
-                            state.message = Some("Opening model library folder…".to_owned());
-                        }
-                        Err(error) => state.message = Some(error),
-                    }
-                }
-                if busy {
-                    ui.spinner();
                 }
             });
 
-            if !state.scan.issues.is_empty() {
-                egui::CollapsingHeader::new(
-                    RichText::new(format!("{} scan issue(s)", state.scan.issues.len()))
-                        .color(Color32::from_rgb(235, 164, 77)),
-                )
-                .show(ui, |ui| {
-                    for issue in &state.scan.issues {
-                        ui.label(
-                            RichText::new(format!(
-                                "{}: {}",
-                                display_filename(&issue.path),
-                                issue.message
-                            ))
-                            .small()
-                            .color(text_dim),
-                        );
+        ui.add_space(4.0);
+        ui.columns(2, |columns| {
+            let busy = context.library_control.is_busy();
+            if columns[0]
+                .add_enabled_ui(!busy, |ui| {
+                    ui.add_sized([ui.available_width(), 30.0], ghost_button("REFRESH"))
+                })
+                .inner
+                .clicked()
+            {
+                state.refresh_pending = true;
+            }
+            if columns[1]
+                .add_enabled_ui(!busy, |ui| {
+                    ui.add_sized([ui.available_width(), 30.0], ghost_button("OPEN FOLDER"))
+                })
+                .inner
+                .clicked()
+            {
+                match submit_library_task(context, LibraryTaskOperation::OpenFolder) {
+                    Ok(()) => {
+                        state.message = Some("Opening model library folder…".to_owned());
                     }
-                });
+                    Err(error) => state.message = Some(error),
+                }
             }
         });
+        if context.library_control.is_busy() {
+            ui.label(RichText::new("LIBRARY BUSY").small().monospace().color(DIM));
+        }
+
+        if !state.scan.issues.is_empty() {
+            egui::CollapsingHeader::new(
+                RichText::new(format!("{} scan issue(s)", state.scan.issues.len())).color(WAITING),
+            )
+            .show(ui, |ui| {
+                for issue in &state.scan.issues {
+                    ui.label(
+                        RichText::new(format!(
+                            "{}: {}",
+                            display_filename(&issue.path),
+                            issue.message
+                        ))
+                        .small()
+                        .color(DIM),
+                    );
+                }
+            });
+        }
+    });
 
     if let Some(pending) = state.pending_model.clone() {
-        ui.add_space(8.0);
+        ui.add_space(6.0);
         egui::Frame::new()
-            .fill(Color32::from_rgb(54, 43, 24))
+            .fill(Color32::from_rgb(47, 37, 19))
+            .stroke(egui::Stroke::new(1.0_f32, WAITING.linear_multiply(0.55)))
             .corner_radius(7.0)
             .inner_margin(10.0)
             .show(ui, |ui| {
                 ui.label(
                     RichText::new("UNSAVED MODEL SETTINGS")
                         .strong()
-                        .color(Color32::from_rgb(245, 190, 95)),
+                        .color(WAITING),
                 );
                 ui.label(format!("Switch to “{}”?", pending.metadata.display_name));
                 ui.horizontal(|ui| {
                     let busy = context.library_control.is_busy();
-                    if ui
-                        .add_enabled(!busy, egui::Button::new("SAVE").small())
-                        .clicked()
-                    {
+                    if ui.add_enabled(!busy, accent_button("SAVE")).clicked() {
                         request_save_current_tone(state, context, true);
                     }
-                    if ui
-                        .add_enabled(!busy, egui::Button::new("DISCARD").small())
-                        .clicked()
-                    {
+                    if ui.add_enabled(!busy, danger_button("DISCARD")).clicked() {
                         request_select_model(state, context, pending.clone());
                     }
-                    if ui
-                        .add_enabled(!busy, egui::Button::new("CANCEL").small())
-                        .clicked()
-                    {
+                    if ui.add_enabled(!busy, ghost_button("CANCEL")).clicked() {
                         state.pending_model = None;
                     }
                 });
@@ -531,163 +500,135 @@ fn player_controls(
     ui: &mut egui::Ui,
     context: &PluginContext<MotPlayerParams>,
     state: &mut EditorState,
-    panel: Color32,
-    panel_alt: Color32,
-    accent: Color32,
-    text_dim: Color32,
 ) {
     let selected = selected_model_entry(state, context);
-    egui::Frame::new()
-        .fill(panel)
-        .corner_radius(8.0)
-        .inner_margin(16.0)
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    ui.label(RichText::new("ACTIVE MODEL").small().color(text_dim));
-                    ui.label(
-                        RichText::new(
-                            selected.as_ref().map_or("NO MODEL — TRANSPARENT", |entry| {
-                                entry.metadata.display_name.as_str()
-                            }),
-                        )
-                        .font(FontId::proportional(22.0))
-                        .strong()
-                        .color(if selected.is_some() {
-                            accent
-                        } else {
-                            Color32::from_rgb(235, 164, 77)
-                        }),
-                    );
-                });
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let dirty = tone_is_dirty(state, context);
-                    ui.label(
-                        RichText::new(if dirty { "UNSAVED *" } else { "SAVED" })
-                            .monospace()
-                            .color(if dirty {
-                                Color32::from_rgb(245, 190, 95)
-                            } else {
-                                text_dim
-                            }),
-                    );
-                });
-            });
-
-            if let Some(entry) = &selected {
+    panel().show(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                ui.label(section_label("ACTIVE MODEL"));
                 ui.label(
-                    RichText::new(format!(
-                        "{} v{}  •  causal  •  0 samples  •  {} MAC/sample",
-                        entry.metadata.architecture_id,
-                        entry.metadata.architecture_version,
-                        entry.metadata.estimated_macs_per_sample
-                    ))
-                    .small()
-                    .monospace()
-                    .color(text_dim),
-                );
-            }
-
-            ui.add_space(10.0);
-            runtime_status(ui, context, accent, text_dim);
-            ui.add_space(16.0);
-            ui.horizontal(|ui| {
-                player_parameter(
-                    ui,
-                    context,
-                    "INPUT GAIN",
-                    P::InputGain,
-                    context.input_gain.value(),
-                    -24.0,
-                    24.0,
-                    " dB",
-                    accent,
-                );
-                player_parameter(
-                    ui,
-                    context,
-                    "TIGHT",
-                    P::Tight,
-                    context.tight.value(),
-                    0.0,
-                    100.0,
-                    "%",
-                    accent,
-                );
-                player_parameter(
-                    ui,
-                    context,
-                    "BITE",
-                    P::Bite,
-                    context.bite.value(),
-                    0.0,
-                    100.0,
-                    "%",
-                    accent,
+                    RichText::new(selected.as_ref().map_or("NO MODEL — TRANSPARENT", |entry| {
+                        entry.metadata.display_name.as_str()
+                    }))
+                    .font(FontId::proportional(22.0))
+                    .strong()
+                    .color(if selected.is_some() { ACCENT } else { WAITING }),
                 );
             });
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let dirty = tone_is_dirty(state, context);
+                ui.label(
+                    RichText::new(if dirty { "UNSAVED *" } else { "SAVED" })
+                        .monospace()
+                        .color(if dirty { WAITING } else { SUCCESS }),
+                );
+            });
+        });
 
-            ui.add_space(16.0);
-            ir_section(ui, context, state, panel_alt, accent, text_dim);
-            ui.add_space(14.0);
-            ui.horizontal(|ui| {
+        if let Some(entry) = &selected {
+            ui.label(
+                RichText::new(format!(
+                    "{} v{}  •  causal  •  0 samples  •  {} MAC/sample",
+                    entry.metadata.architecture_id,
+                    entry.metadata.architecture_version,
+                    entry.metadata.estimated_macs_per_sample
+                ))
+                .small()
+                .monospace()
+                .color(DIM),
+            );
+        }
+
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            runtime_status(ui, context);
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let has_model = selected.is_some();
                 let busy = context.library_control.is_busy();
-                if ui
-                    .add_enabled(has_model && !busy, egui::Button::new("SAVE"))
-                    .clicked()
-                {
-                    request_save_current_tone(state, context, false);
-                }
                 if ui
                     .add_enabled(
                         has_model
                             && !busy
                             && state.baseline.is_some()
                             && tone_is_dirty(state, context),
-                        egui::Button::new("REVERT"),
+                        ghost_button("REVERT"),
                     )
                     .clicked()
                 {
                     revert_current_tone(state, context);
                 }
-                ui.separator();
-                ui.label(
-                    RichText::new(format!(
-                        "runtime generation {}",
-                        context.runtime_generation.load()
-                    ))
-                    .small()
-                    .monospace()
-                    .color(text_dim),
-                );
+                if ui
+                    .add_enabled(has_model && !busy, accent_button("SAVE"))
+                    .clicked()
+                {
+                    request_save_current_tone(state, context, false);
+                }
             });
-            if let Some(message) = &state.message {
-                ui.add_space(8.0);
-                ui.label(
-                    RichText::new(message)
-                        .small()
-                        .color(Color32::from_rgb(235, 164, 77)),
-                );
-            }
         });
+    });
+
+    ui.add_space(10.0);
+    panel().show(ui, |ui| {
+        ui.columns(3, |columns| {
+            player_parameter(
+                &mut columns[0],
+                context,
+                PlayerParameter {
+                    label: "INPUT GAIN · dB",
+                    id: P::InputGain,
+                    value: context.input_gain.value(),
+                    minimum: -24.0,
+                    maximum: 24.0,
+                    percent: false,
+                },
+            );
+            player_parameter(
+                &mut columns[1],
+                context,
+                PlayerParameter {
+                    label: "TIGHT",
+                    id: P::Tight,
+                    value: context.tight.value(),
+                    minimum: 0.0,
+                    maximum: 100.0,
+                    percent: true,
+                },
+            );
+            player_parameter(
+                &mut columns[2],
+                context,
+                PlayerParameter {
+                    label: "BITE",
+                    id: P::Bite,
+                    value: context.bite.value(),
+                    minimum: 0.0,
+                    maximum: 100.0,
+                    percent: true,
+                },
+            );
+        });
+    });
+
+    ui.add_space(10.0);
+    ir_section(ui, context, state);
+    if let Some(message) = &state.message {
+        ui.add_space(8.0);
+        ui.label(RichText::new(message).small().color(WAITING));
+    }
 }
 
-fn runtime_status(
-    ui: &mut egui::Ui,
-    context: &PluginContext<MotPlayerParams>,
-    accent: Color32,
-    text_dim: Color32,
-) {
+fn runtime_status(ui: &mut egui::Ui, context: &PluginContext<MotPlayerParams>) {
     let meter = context.get_meter(P::RuntimeStatus);
     let state = context.runtime_control.get();
     let (label, detail, color) = match state {
         RuntimeUiState::Transparent => (
             "TRANSPARENT",
             "No model selected; input passes through unchanged.".to_owned(),
-            text_dim,
+            DIM,
         ),
-        RuntimeUiState::Loading => ("LOADING", "Preparing model and cabinet…".to_owned(), accent),
+        RuntimeUiState::Loading => ("LOADING", "Preparing model and cabinet…".to_owned(), ACCENT),
         RuntimeUiState::Ready {
             model_name,
             ir_name,
@@ -697,13 +638,11 @@ fn runtime_status(
                 || format!("{model_name} • uncabbed"),
                 |ir| format!("{model_name} • {ir}"),
             ),
-            Color32::from_rgb(77, 190, 134),
+            SUCCESS,
         ),
-        RuntimeUiState::SafeMuted { asset, message } => (
-            "SAFE MUTE",
-            format!("{asset:?}: {message}"),
-            Color32::from_rgb(235, 95, 95),
-        ),
+        RuntimeUiState::SafeMuted { asset, message } => {
+            ("SAFE MUTE", format!("{asset:?}: {message}"), ERROR)
+        }
     };
     let visible_label = if meter < 0.25 && label != "SAFE MUTE" {
         "SAFE MUTE"
@@ -713,15 +652,10 @@ fn runtime_status(
         label
     };
     ui.horizontal(|ui| {
-        ui.label(RichText::new("RUNTIME").small().color(text_dim));
-        ui.label(
-            RichText::new(visible_label)
-                .strong()
-                .monospace()
-                .color(color),
-        );
+        ui.label(field_label("RUNTIME"));
+        ui.label(status_text(visible_label, color));
+        ui.label(RichText::new(detail).small().monospace().color(color));
     });
-    ui.label(RichText::new(detail).small().color(color));
     if meter < 0.25
         && !matches!(
             context.runtime_control.get(),
@@ -731,37 +665,53 @@ fn runtime_status(
         ui.label(
             RichText::new("MOT PLAYER requires a 48 kHz host session.")
                 .small()
-                .color(Color32::from_rgb(235, 95, 95)),
+                .color(ERROR),
         );
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn player_parameter(
-    ui: &mut egui::Ui,
-    context: &PluginContext<MotPlayerParams>,
-    label: &str,
+struct PlayerParameter<'a> {
+    label: &'a str,
     id: P,
     value: f32,
     minimum: f32,
     maximum: f32,
-    suffix: &str,
-    accent: Color32,
+    percent: bool,
+}
+
+fn player_parameter(
+    ui: &mut egui::Ui,
+    context: &PluginContext<MotPlayerParams>,
+    parameter: PlayerParameter<'_>,
 ) {
-    ui.vertical(|ui| {
-        ui.set_width((ui.available_width() / 3.0).max(170.0));
-        ui.label(RichText::new(label).strong().color(accent));
-        let mut edited = value;
-        if ui
-            .add(
-                egui::Slider::new(&mut edited, minimum..=maximum)
-                    .suffix(suffix)
-                    .step_by(0.1)
-                    .fixed_decimals(1),
-            )
-            .changed()
-        {
-            automate_linear(context, id, edited, minimum, maximum);
+    ui.vertical_centered(|ui| {
+        ui.set_width((ui.available_width() / 3.0).max(142.0));
+        let mut edited = parameter.value;
+        let value_text = if parameter.percent {
+            format!("{edited:.0}%")
+        } else {
+            format!("{edited:+.1}")
+        };
+        let response = parameter_knob(
+            ui,
+            &mut edited,
+            KnobSpec {
+                label: parameter.label,
+                value_text: &value_text,
+                minimum: parameter.minimum,
+                maximum: parameter.maximum,
+                default: 0.0,
+                step: 0.1,
+            },
+        );
+        if response.changed() {
+            automate_linear(
+                context,
+                parameter.id,
+                edited,
+                parameter.minimum,
+                parameter.maximum,
+            );
         }
     });
 }
@@ -770,151 +720,141 @@ fn ir_section(
     ui: &mut egui::Ui,
     context: &PluginContext<MotPlayerParams>,
     state: &mut EditorState,
-    panel_alt: Color32,
-    accent: Color32,
-    text_dim: Color32,
 ) {
-    egui::Frame::new()
-        .fill(panel_alt)
-        .corner_radius(7.0)
-        .inner_margin(12.0)
-        .show(ui, |ui| {
-            ui.label(RichText::new("CABINET IR").strong().color(accent));
-            let current_path = read_shared_string(&context.selected_ir_path);
-            let selected_name = if current_path.is_empty() {
-                "NO IR".to_owned()
-            } else {
-                ir_display_name(state, Path::new(&current_path))
-            };
+    panel().show(ui, |ui| {
+        let current_path = read_shared_string(&context.selected_ir_path);
+        let selected_name = if current_path.is_empty() {
+            "NO IR".to_owned()
+        } else {
+            ir_display_name(state, Path::new(&current_path))
+        };
 
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("IR").color(text_dim));
-                egui::ComboBox::from_id_salt("mot_player_ir_selector")
-                    .selected_text(selected_name)
-                    .width(280.0)
-                    .show_ui(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.label(section_label("CABINET IR"));
+            egui::ComboBox::from_id_salt("mot_player_ir_selector")
+                .selected_text(selected_name)
+                .width(300.0)
+                .show_ui(ui, |ui| {
+                    if ui
+                        .selectable_label(current_path.is_empty(), "NO IR")
+                        .clicked()
+                    {
+                        clear_selected_ir(context);
+                    }
+                    for path in state.ir_files.clone() {
+                        let encoded = path.to_string_lossy().into_owned();
                         if ui
-                            .selectable_label(current_path.is_empty(), "NO IR")
+                            .selectable_label(
+                                encoded == current_path,
+                                ir_display_name(state, &path),
+                            )
                             .clicked()
                         {
-                            clear_selected_ir(context);
-                        }
-                        for path in state.ir_files.clone() {
-                            let encoded = path.to_string_lossy().into_owned();
-                            if ui
-                                .selectable_label(
-                                    encoded == current_path,
-                                    ir_display_name(state, &path),
-                                )
-                                .clicked()
-                            {
-                                match select_ir_path(context, state, &path) {
-                                    Ok(()) => state.message = None,
-                                    Err(error) => state.message = Some(error),
-                                }
+                            match select_ir_path(context, state, &path) {
+                                Ok(()) => state.message = None,
+                                Err(error) => state.message = Some(error),
                             }
                         }
-                    });
-
-                let busy = context.ir_import_control.is_busy();
-                if ui
-                    .add_enabled(!busy, egui::Button::new("IMPORT IR…").small())
-                    .clicked()
-                    && let Some(source) = rfd::FileDialog::new()
-                        .add_filter("WAV audio", &["wav", "WAV"])
-                        .pick_file()
-                {
-                    if !context.ir_import_control.try_begin() {
-                        state.message = Some("An IR import is already running".to_owned());
-                    } else if let Some(spawner) = context.tasks::<ImportIrTask>() {
-                        match spawner.try_spawn(ImportIrTask { source }) {
-                            Ok(()) => {
-                                state.message = Some("Importing IR in the background…".to_owned());
-                            }
-                            Err(_) => {
-                                context.ir_import_control.cancel_begin();
-                                state.message = Some("IR import worker queue is full".to_owned());
-                            }
-                        }
-                    } else {
-                        context.ir_import_control.cancel_begin();
-                        state.message =
-                            Some("IR import worker is unavailable in this host".to_owned());
                     }
-                }
-                if busy {
-                    ui.spinner();
-                }
-                if ui.small_button("REFRESH IRs").clicked() {
-                    state.refresh_pending = true;
-                }
-            });
+                });
 
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("PROCESSING").color(text_dim));
-                let current = IrUiMode::from_param(context.ir_processing.value());
-                for (mode, label) in [
-                    (IrUiMode::MinimumPhase, "MINIMUM PHASE + AUTO-TRIM"),
-                    (IrUiMode::Raw, "RAW"),
-                ] {
-                    if ui.selectable_label(current == mode, label).clicked() {
-                        context.automate(P::IrProcessing, mode.normalized());
-                        bump_runtime_generation(context);
+            let busy = context.ir_import_control.is_busy();
+            if ui.add_enabled(!busy, ghost_button("IMPORT…")).clicked()
+                && let Some(source) = rfd::FileDialog::new()
+                    .add_filter("WAV audio", &["wav", "WAV"])
+                    .pick_file()
+            {
+                if !context.ir_import_control.try_begin() {
+                    state.message = Some("An IR import is already running".to_owned());
+                } else if let Some(spawner) = context.tasks::<ImportIrTask>() {
+                    match spawner.try_spawn(ImportIrTask { source }) {
+                        Ok(()) => {
+                            state.message = Some("Importing IR in the background…".to_owned());
+                        }
+                        Err(_) => {
+                            context.ir_import_control.cancel_begin();
+                            state.message = Some("IR import worker queue is full".to_owned());
+                        }
                     }
-                }
-            });
-
-            if current_path.is_empty() {
-                ui.label(
-                    RichText::new("Amp output is currently uncabbed.")
-                        .small()
-                        .color(text_dim),
-                );
-            } else {
-                let verified = state.ir_metadata.contains_key(Path::new(&current_path));
-                ui.label(
-                    RichText::new(&current_path)
-                        .small()
-                        .monospace()
-                        .color(if verified {
-                            text_dim
-                        } else {
-                            Color32::from_rgb(235, 164, 77)
-                        }),
-                );
-                if let Some(metadata) = state.ir_metadata.get(Path::new(&current_path)) {
-                    ui.label(
-                        RichText::new(format!(
-                            "ARCHIVED RAW • {} samples @ {} Hz • MPT auto-trim: {} samples",
-                            metadata.sample_count,
-                            metadata.sample_rate_hz,
-                            metadata.default_trim_leading_samples
-                        ))
-                        .small()
-                        .monospace()
-                        .color(text_dim),
-                    );
-                    ui.label(
-                        RichText::new(format!(
-                            "SOURCE: {} • SHA-256 {}",
-                            metadata.original_filename, metadata.sha256
-                        ))
-                        .small()
-                        .monospace()
-                        .color(text_dim),
-                    );
+                } else {
+                    context.ir_import_control.cancel_begin();
+                    state.message = Some("IR import worker is unavailable in this host".to_owned());
                 }
             }
-            if IrUiMode::from_param(context.ir_processing.value()) == IrUiMode::Raw {
-                ui.label(
-                    RichText::new(
-                        "RAW preserves the IR phase and any intrinsic delay contained in the file.",
-                    )
-                    .small()
-                    .color(Color32::from_rgb(235, 164, 77)),
-                );
+            if ui.add(ghost_button("REFRESH")).clicked() {
+                state.refresh_pending = true;
+            }
+            if busy {
+                ui.label(RichText::new("IMPORTING").small().monospace().color(ACCENT));
             }
         });
+
+        ui.horizontal(|ui| {
+            ui.label(field_label("PROCESSING"));
+            let current = IrUiMode::from_param(context.ir_processing.value());
+            for (mode, label) in [
+                (IrUiMode::MinimumPhase, "MINIMUM PHASE + AUTO-TRIM"),
+                (IrUiMode::Raw, "RAW"),
+            ] {
+                let button = if current == mode {
+                    mot_ui::selected_model_button(label)
+                } else {
+                    ghost_button(label)
+                };
+                if ui.add(button).clicked() {
+                    context.automate(P::IrProcessing, mode.normalized());
+                    bump_runtime_generation(context);
+                }
+            }
+        });
+
+        if current_path.is_empty() {
+            ui.label(
+                RichText::new("Amp output is currently uncabbed.")
+                    .small()
+                    .color(DIM),
+            );
+        } else {
+            let verified = state.ir_metadata.contains_key(Path::new(&current_path));
+            ui.label(
+                RichText::new(&current_path)
+                    .small()
+                    .monospace()
+                    .color(if verified { DIM } else { WAITING }),
+            );
+            if let Some(metadata) = state.ir_metadata.get(Path::new(&current_path)) {
+                ui.label(
+                    RichText::new(format!(
+                        "ARCHIVED RAW • {} samples @ {} Hz • MPT auto-trim: {} samples",
+                        metadata.sample_count,
+                        metadata.sample_rate_hz,
+                        metadata.default_trim_leading_samples
+                    ))
+                    .small()
+                    .monospace()
+                    .color(DIM),
+                );
+                ui.label(
+                    RichText::new(format!(
+                        "SOURCE: {} • SHA-256 {}",
+                        metadata.original_filename, metadata.sha256
+                    ))
+                    .small()
+                    .monospace()
+                    .color(DIM),
+                );
+            }
+        }
+        if IrUiMode::from_param(context.ir_processing.value()) == IrUiMode::Raw {
+            ui.label(
+                RichText::new(
+                    "RAW preserves the IR phase and any intrinsic delay contained in the file.",
+                )
+                .small()
+                .color(WAITING),
+            );
+        }
+    });
 }
 
 fn sort_ir_files(state: &mut EditorState) {

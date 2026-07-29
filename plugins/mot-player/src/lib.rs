@@ -864,6 +864,17 @@ mod tests {
     }
 
     #[test]
+    fn editor_has_a_headless_render_path() {
+        let params = Arc::new(MotPlayerParams::new());
+        let mut editor = EguiEditor::with_ui(Arc::clone(&params), WINDOW_SIZE, MotPlayerUi);
+        let erased: Arc<dyn truce::params::Params> = params;
+        assert_eq!(Editor::size(&editor), WINDOW_SIZE);
+        if let Some((_, width, height)) = Editor::screenshot(&mut editor, erased) {
+            assert_eq!((width, height), (WINDOW_SIZE.0 * 2, WINDOW_SIZE.1 * 2));
+        }
+    }
+
+    #[test]
     fn restored_state_forces_runtime_reload_when_generation_is_unchanged() {
         let params = MotPlayerParams::new();
         params.runtime_generation.store(7);

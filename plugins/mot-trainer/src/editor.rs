@@ -1,9 +1,15 @@
+use std::process::{Command, Stdio};
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use egui::{Align, Color32, Layout, RichText, Stroke, Vec2};
+use egui::{Align, Color32, Layout, RichText, Vec2};
 use mot_core::capture::CaptureTarget;
-use mot_core::model_library::TrainerCapturePreset;
+use mot_core::model_library::{ModelLibrary, TrainerCapturePreset};
+use mot_ui::{
+    ACCENT, BACKGROUND, DIM, ERROR, SUCCESS, TEXT, WAITING, accent_button, background_frame,
+    danger_button, field_label, ghost_button, panel, raised_panel, section_label,
+    selected_model_button, status_text,
+};
 use truce::prelude::*;
 use truce_egui::EditorUi;
 
@@ -13,11 +19,11 @@ use crate::{
 };
 
 pub const WINDOW_SIZE: (u32, u32) = (720, 480);
-const EDITOR_STATE_ID: &str = "mot_trainer_editor_state_v2";
-const EDITOR_MARGIN: f32 = 22.0;
-const PANEL_MARGIN: f32 = 20.0;
-const SECTION_GAP: f32 = 16.0;
-const ROW_GAP: f32 = 10.0;
+const EDITOR_STATE_ID: &str = "mot_trainer_editor_state_v3";
+const MODEL_BROWSER_WIDTH: f32 = 216.0;
+const COLUMN_GAP: f32 = 10.0;
+const CARD_HEIGHT: f32 = 48.0;
+const CONFIG_FIELD_WIDTH: f32 = 280.0;
 
 #[derive(Clone, Debug, Default)]
 struct EditorState {
@@ -40,386 +46,421 @@ impl EditorUi<MotTrainerParams> for MotTrainerUi {
             .data_mut(|data| data.get_temp::<EditorState>(state_id).unwrap_or_default());
         service_model_catalog(&mut state, context);
 
-        let background = Color32::from_rgb(10, 12, 14);
-        let panel = Color32::from_rgb(20, 24, 28);
-        let accent = Color32::from_rgb(58, 220, 210);
-        let text = Color32::from_rgb(228, 235, 238);
-        let dim = Color32::from_rgb(135, 148, 155);
-        let editor_rect = ui.max_rect();
-        let content_width = (editor_rect.width() - EDITOR_MARGIN * 2.0).max(0.0);
-        ui.visuals_mut().panel_fill = background;
-        ui.visuals_mut().override_text_color = Some(text);
-        ui.painter().rect_filled(editor_rect, 0.0, background);
-
-        egui::Frame::new()
-            .fill(background)
-            .inner_margin(EDITOR_MARGIN)
-            .show(ui, |ui| {
-                ui.set_min_width(content_width);
-                header(ui, context, background, accent, text, dim);
-                ui.add_space(SECTION_GAP);
-
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        ui.set_min_width(content_width);
-                        settings_panel(ui, context, &mut state, content_width, panel, dim);
-                        ui.add_space(SECTION_GAP);
-                        metadata_editor(ui, context, dim);
-                        ui.add_space(SECTION_GAP);
-                        status_panel(
-                            ui,
-                            context,
-                            content_width,
-                            background,
-                            panel,
-                            accent,
-                            text,
-                            dim,
-                        );
-                    });
+        mot_ui::apply(ui);
+        ui.painter().rect_filled(ui.max_rect(), 0.0, BACKGROUND);
+        background_frame().show(ui, |ui| {
+            mot_ui::header(ui, "MOT TRAINER", VERSION, false, |ui| {
+                monitor_button(ui, context);
             });
+
+            let content_height = ui.available_height();
+            ui.horizontal_top(|ui| {
+                fixed_vertical_panel(ui, Vec2::new(MODEL_BROWSER_WIDTH, content_height), |ui| {
+                    model_browser(ui, context, &mut state)
+                });
+                ui.add_space(COLUMN_GAP);
+                fixed_vertical_panel(ui, Vec2::new(ui.available_width(), content_height), |ui| {
+                    main_workspace(ui, context, &mut state)
+                });
+            });
+        });
 
         ui.ctx().data_mut(|data| data.insert_temp(state_id, state));
     }
 }
 
-fn header(
+fn fixed_vertical_panel<R>(
     ui: &mut egui::Ui,
-    context: &PluginContext<MotTrainerParams>,
-    background: Color32,
-    accent: Color32,
-    text: Color32,
-    dim: Color32,
-) {
-    ui.horizontal(|ui| {
-        ui.label(RichText::new("MOT TRAINER").size(27.0).color(accent));
-        ui.label(
-            RichText::new(format!("{VERSION}  •  MONO  •  48 kHz"))
-                .monospace()
-                .color(dim),
-        );
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            let available = monitor_control_available(context.control.status());
-            let requested = context.monitor.value();
-            if !available && requested {
-                context.automate(P::Monitor, 0.0);
-            }
-            let monitoring = available && requested;
-            let label_color = if monitoring {
-                background
-            } else if available {
-                text
-            } else {
-                dim
-            };
-            let button = egui::Button::new(RichText::new("MONITOR").color(label_color)).fill(
-                if monitoring {
-                    accent
-                } else {
-                    Color32::from_rgb(42, 48, 52)
-                },
-            );
-            if ui.add_enabled(available, button).clicked() {
-                context.automate(P::Monitor, if monitoring { 0.0 } else { 1.0 });
-            }
-        });
-    });
+    size: Vec2,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> egui::InnerResponse<R> {
+    ui.allocate_ui_with_layout(size, Layout::top_down(Align::Min), |ui| {
+        let panel_rect = ui.max_rect();
+        ui.set_width(size.x);
+        ui.shrink_clip_rect(panel_rect);
+        add_contents(ui)
+    })
 }
 
-fn settings_panel(
+fn monitor_button(ui: &mut egui::Ui, context: &PluginContext<MotTrainerParams>) {
+    let available = monitor_control_available(context.control.status());
+    let requested = context.monitor.value();
+    if !available && requested {
+        context.automate(P::Monitor, 0.0);
+    }
+    let monitoring = available && requested;
+    let label = RichText::new("MONITOR")
+        .strong()
+        .color(if monitoring { BACKGROUND } else { TEXT });
+    let button = if monitoring {
+        accent_button(label)
+    } else {
+        ghost_button(label)
+    };
+    if ui.add_enabled(available, button).clicked() {
+        context.automate(P::Monitor, if monitoring { 0.0 } else { 1.0 });
+    }
+}
+
+fn model_browser(
     ui: &mut egui::Ui,
     context: &PluginContext<MotTrainerParams>,
     state: &mut EditorState,
-    content_width: f32,
-    panel: Color32,
-    dim: Color32,
 ) {
-    egui::Frame::new()
-        .fill(panel)
-        .stroke(Stroke::new(1.0_f32, Color32::from_rgb(44, 52, 58)))
-        .corner_radius(10.0)
-        .inner_margin(PANEL_MARGIN)
-        .show(ui, |ui| {
-            ui.set_min_width((content_width - PANEL_MARGIN * 2.0).max(0.0));
-            egui::Grid::new("trainer_settings")
-                .num_columns(2)
-                .spacing([18.0, ROW_GAP])
-                .show(ui, |ui| {
-                    model_editor(ui, context, state, dim);
-
-                    ui.label(RichText::new("MAX PASSES").color(dim));
-                    let mut epochs = context.max_epochs.value_i32();
-                    if ui
-                        .add(egui::DragValue::new(&mut epochs).range(1..=400).speed(1))
-                        .changed()
-                    {
-                        context.automate(P::MaxEpochs, f64::from(epochs - 1) / 399.0);
-                    }
-                    ui.end_row();
-                });
+    let height = ui.available_height();
+    panel().show(ui, |ui| {
+        ui.set_min_height((height - 34.0).max(0.0));
+        ui.horizontal(|ui| {
+            ui.label(section_label("MODELS"));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.label(
+                    RichText::new(state.models.len().to_string())
+                        .monospace()
+                        .color(DIM),
+                );
+            });
         });
-}
 
-fn model_editor(
-    ui: &mut egui::Ui,
-    context: &PluginContext<MotTrainerParams>,
-    state: &mut EditorState,
-    dim: Color32,
-) {
-    ui.label(RichText::new("MODEL").color(dim));
-    let editing_enabled = model_editing_enabled(context.control.status());
-    ui.horizontal(|ui| {
-        let mut edited = read_lock_string(&context.model_name);
-        if ui
-            .add_enabled(
-                editing_enabled,
-                egui::TextEdit::singleline(&mut edited)
-                    .hint_text("Captured Amp")
-                    .desired_width(390.0),
-            )
-            .changed()
-        {
-            write_lock_string(&context.model_name, &edited);
+        let editing_enabled = model_editing_enabled(context.control.status());
+        let new_selected = state.selected_model_id.is_none();
+        let new_label = RichText::new("+ NEW MODEL")
+            .strong()
+            .color(if new_selected { ACCENT } else { TEXT });
+        let new_button = if new_selected {
+            selected_model_button(new_label)
+        } else {
+            ghost_button(new_label)
+        }
+        .min_size(Vec2::new(ui.available_width(), 36.0));
+        if ui.add_enabled(editing_enabled, new_button).clicked() {
             state.selected_model_id = None;
+            state.model_message = None;
+            write_lock_string(&context.model_name, "");
         }
 
-        let picker_enabled = editing_enabled
-            && !state.models.is_empty()
-            && !context.model_control.is_busy();
-        let picker = ui
-            .add_enabled_ui(picker_enabled, |ui| {
-                ui.spacing_mut().button_padding = Vec2::new(7.0, 3.0);
-                ui.menu_button(RichText::new("▾").size(15.0), |ui| {
-                    for model in state.models.clone() {
-                        let selected =
-                            state.selected_model_id.as_deref() == Some(model.model_id.as_str());
-                        let response = ui
-                            .selectable_label(selected, &model.display_name)
-                            .on_hover_text(&model.model_id);
-                        if response.clicked() {
-                            apply_retrain_model(context, &model);
-                            state.selected_model_id = Some(model.model_id.clone());
-                            state.model_message = model.metadata_error.clone().or_else(|| {
-                                model.capture.is_none().then(|| {
-                                    "Capture metadata is unavailable; only the model name was loaded"
-                                        .to_owned()
-                                })
-                            });
-                            ui.close();
-                        }
-                    }
-                })
-            })
-            .inner;
+        let controls_height = 76.0;
+        let list_height = (ui.available_height() - controls_height).max(96.0);
+        let models = state.models.clone();
+        egui::ScrollArea::vertical()
+            .id_salt("mot_trainer_model_browser")
+            .max_height(list_height)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                if models.is_empty() {
+                    ui.label(
+                        RichText::new(if context.model_control.is_busy() {
+                            "Scanning model library…"
+                        } else {
+                            "No models yet"
+                        })
+                        .italics()
+                        .color(DIM),
+                    );
+                    ui.label(
+                        RichText::new("Capture a new tone to create the first model.")
+                            .small()
+                            .color(DIM),
+                    );
+                }
+
+                for model in models {
+                    model_card(ui, context, state, model, editing_enabled);
+                }
+            });
+
+        ui.separator();
+        ui.horizontal_wrapped(|ui| {
+            let busy = context.model_control.is_busy();
+            if ui
+                .add_enabled(!busy, ghost_button("REFRESH").small())
+                .clicked()
+            {
+                request_model_catalog(state, context);
+            }
+            if ui
+                .add_enabled(!busy, ghost_button("OPEN FOLDER").small())
+                .clicked()
+            {
+                state.model_message = open_models_folder().err();
+            }
+            if busy {
+                ui.label(RichText::new("BUSY").small().monospace().color(DIM));
+            }
+        });
+
         if let Some(message) = &state.model_message {
-            picker.response.on_hover_text(message);
-        } else if state.models.is_empty() {
-            picker.response.on_hover_text("No existing models");
+            ui.label(
+                RichText::new(message)
+                    .small()
+                    .color(Color32::from_rgb(235, 164, 77)),
+            );
         }
     });
-    ui.end_row();
 }
 
-fn metadata_editor(ui: &mut egui::Ui, context: &PluginContext<MotTrainerParams>, dim: Color32) {
-    egui::CollapsingHeader::new("CAPTURE METADATA")
-        .default_open(false)
+fn model_card(
+    ui: &mut egui::Ui,
+    context: &PluginContext<MotTrainerParams>,
+    state: &mut EditorState,
+    model: RetrainModel,
+    editing_enabled: bool,
+) {
+    let selected = state.selected_model_id.as_deref() == Some(model.model_id.as_str());
+    let source_label = if model.capture.is_some() {
+        "RETRAIN READY"
+    } else {
+        "MODEL ONLY"
+    };
+    let label = format!("{}\n{}", model.display_name, source_label);
+    let text = RichText::new(label).color(if selected { ACCENT } else { TEXT });
+    let button = if selected {
+        selected_model_button(text)
+    } else {
+        ghost_button(text)
+    }
+    .min_size(Vec2::new(ui.available_width(), CARD_HEIGHT));
+
+    let response = ui.add_enabled(editing_enabled, button);
+    let response = if let Some(error) = &model.metadata_error {
+        response.on_hover_text(format!("{}\n{error}", model.model_id))
+    } else if model.capture.is_none() {
+        response.on_hover_text(format!(
+            "{}\nCapture metadata is unavailable; only the model name can be reused",
+            model.model_id
+        ))
+    } else {
+        response.on_hover_text(format!(
+            "{}\nLoad this model's capture metadata for retraining",
+            model.model_id
+        ))
+    };
+    if response.clicked() && !selected {
+        apply_retrain_model(context, &model);
+        state.selected_model_id = Some(model.model_id.clone());
+        state.model_message = model.metadata_error.clone().or_else(|| {
+            model.capture.is_none().then(|| {
+                "Capture metadata is unavailable; only the model name was loaded".to_owned()
+            })
+        });
+    }
+}
+
+fn open_models_folder() -> Result<(), String> {
+    let library = ModelLibrary::for_current_user().map_err(|error| error.to_string())?;
+    library
+        .ensure_directories()
+        .map_err(|error| error.to_string())?;
+    Command::new("/usr/bin/open")
+        .arg(&library.paths().models)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("Could not open model folder: {error}"))
+}
+
+fn main_workspace(
+    ui: &mut egui::Ui,
+    context: &PluginContext<MotTrainerParams>,
+    state: &mut EditorState,
+) {
+    egui::ScrollArea::vertical()
+        .id_salt("mot_trainer_workspace")
+        .auto_shrink([false, false])
         .show(ui, |ui| {
-            egui::Grid::new("trainer_metadata")
-                .num_columns(2)
-                .spacing([18.0, ROW_GAP])
-                .show(ui, |ui| {
-                    text_field(ui, "AMPLIFIER", &context.amplifier, "EVH 5153", dim);
-                    text_field(ui, "CHANNEL", &context.amplifier_channel, "Blue", dim);
-                    text_field(
-                        ui,
-                        "CONTROLS",
-                        &context.control_positions,
-                        "Gain 5, Bass 4…",
-                        dim,
-                    );
-                    text_field(
-                        ui,
-                        "INTERFACE OUT",
-                        &context.interface_output,
-                        "Line Out 3",
-                        dim,
-                    );
-                    text_field(ui, "INTERFACE IN", &context.interface_input, "Input 1", dim);
-                    text_field(ui, "REAMP BOX", &context.reamp_box, "Model", dim);
-                    text_field(
-                        ui,
-                        "REACTIVE LOAD",
-                        &context.reactive_load,
-                        "Model / raw out",
-                        dim,
-                    );
-                    ui.label(RichText::new("IMPEDANCE").color(dim));
-                    let mut impedance = context.load_impedance_ohms.load().min(64);
-                    if ui
-                        .add(
-                            egui::DragValue::new(&mut impedance)
-                                .range(0..=64)
-                                .suffix(" Ω"),
-                        )
-                        .changed()
-                    {
-                        context.load_impedance_ohms.store(impedance);
-                    }
-                    ui.end_row();
-                    text_field(
-                        ui,
-                        "RETURN GAIN",
-                        &context.return_gain_note,
-                        "Interface gain / pad",
-                        dim,
-                    );
-                });
+            model_configuration(ui, context, state);
+            ui.add_space(mot_ui::SECTION_GAP);
+            status_panel(ui, context);
+            ui.add_space(mot_ui::SECTION_GAP);
+            metadata_editor(ui, context);
         });
 }
 
-#[allow(clippy::too_many_arguments)]
-fn status_panel(
+fn model_configuration(
     ui: &mut egui::Ui,
     context: &PluginContext<MotTrainerParams>,
-    content_width: f32,
-    background: Color32,
-    panel: Color32,
-    accent: Color32,
-    text: Color32,
-    dim: Color32,
+    state: &mut EditorState,
 ) {
+    let editing_enabled = model_editing_enabled(context.control.status());
+    panel().show(ui, |ui| {
+        ui.label(section_label("MODEL SETUP"));
+        egui::Grid::new("mot_trainer_model_setup")
+            .num_columns(2)
+            .spacing([22.0, mot_ui::ROW_GAP])
+            .show(ui, |ui| {
+                ui.label(field_label("MODEL"));
+                let mut edited = read_lock_string(&context.model_name);
+                if ui
+                    .add_enabled(
+                        editing_enabled,
+                        egui::TextEdit::singleline(&mut edited)
+                            .hint_text("Captured Amp")
+                            .desired_width(CONFIG_FIELD_WIDTH),
+                    )
+                    .changed()
+                {
+                    write_lock_string(&context.model_name, &edited);
+                    state.selected_model_id = None;
+                }
+                ui.end_row();
+
+                ui.label(field_label("MAX PASSES"));
+                let mut epochs = context.max_epochs.value_i32();
+                if ui
+                    .add_enabled(
+                        editing_enabled,
+                        egui::DragValue::new(&mut epochs)
+                            .range(1..=400)
+                            .speed(1)
+                            .suffix(" passes"),
+                    )
+                    .changed()
+                {
+                    context.automate(P::MaxEpochs, f64::from(epochs - 1) / 399.0);
+                }
+                ui.end_row();
+            });
+
+        if let Some(selected) = state.selected_model_id.as_deref() {
+            ui.label(
+                RichText::new(format!("RETRAIN SOURCE  •  {selected}"))
+                    .small()
+                    .monospace()
+                    .color(DIM),
+            );
+        }
+    });
+}
+
+fn status_panel(ui: &mut egui::Ui, context: &PluginContext<MotTrainerParams>) {
     let status = context.control.status();
     let capture_progress = context.get_meter(P::CaptureProgress).clamp(0.0, 1.0);
     let training = context.control.training_snapshot();
 
-    egui::Frame::new()
-        .fill(panel)
-        .stroke(Stroke::new(1.0_f32, Color32::from_rgb(44, 52, 58)))
-        .corner_radius(10.0)
-        .inner_margin(PANEL_MARGIN)
-        .show(ui, |ui| {
-            ui.set_min_width((content_width - PANEL_MARGIN * 2.0).max(0.0));
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("STATUS").color(dim));
-                ui.label(
-                    RichText::new(status.label())
-                        .monospace()
-                        .strong()
-                        .color(status.color(accent)),
-                );
-            });
-
-            if capture_details_visible(status, capture_progress) {
-                ui.add_space(ROW_GAP);
-                ui.add(
-                    egui::ProgressBar::new(capture_progress)
-                        .text(format!("RECORDED {:.1}%", capture_progress * 100.0))
-                        .fill(Color32::from_rgb(36, 142, 132)),
-                );
-            }
-
-            if training_details_visible(status, &training) {
-                ui.add_space(ROW_GAP);
-                ui.add(
-                    egui::ProgressBar::new(training.progress)
-                        .text(format!(
-                            "TRAINING PASS {} / {}  •  BEST ESR {:.4}",
-                            training.epoch, training.maximum_epochs, training.best_esr
-                        ))
-                        .fill(Color32::from_rgb(52, 115, 164)),
-                );
-                ui.add_space(ROW_GAP);
-                ui.label(
-                    RichText::new(training_detail_text(&training))
-                        .small()
-                        .monospace()
-                        .color(dim),
-                );
-            }
-
-            ui.add_space(SECTION_GAP);
-            action_button(ui, context, status, background, accent, text);
-
-            let error = context.control.last_error();
-            if !error.is_empty() {
-                ui.add_space(ROW_GAP);
-                ui.label(
-                    RichText::new(error)
-                        .small()
-                        .color(Color32::from_rgb(235, 95, 95)),
-                );
-            }
-            if let Some(model) = context.control.last_saved_model() {
-                ui.add_space(ROW_GAP);
-                ui.label(
-                    RichText::new(format!("SAVED MODEL: {}", model.model_id))
-                        .monospace()
-                        .color(accent),
-                );
-            }
+    panel().show(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.label(field_label("STATUS"));
+            ui.label(status_text(status.label(), status_color(status)));
         });
+        ui.label(RichText::new(status_guidance(status)).small().color(DIM));
+
+        if capture_details_visible(status, capture_progress) {
+            mot_ui::progress(
+                ui,
+                capture_progress,
+                format!("RECORDED {:.1}%", capture_progress * 100.0),
+            );
+        }
+
+        if training_details_visible(status, &training) {
+            let progress_text = if training.epoch == 0 {
+                "PREPARING TRAINING".to_owned()
+            } else {
+                format!(
+                    "PASS {} / {}  •  BEST ESR {:.4}",
+                    training.epoch, training.maximum_epochs, training.best_esr
+                )
+            };
+            mot_ui::progress(ui, training.progress, progress_text);
+            ui.label(
+                RichText::new(training_detail_text(&training))
+                    .small()
+                    .monospace()
+                    .color(DIM),
+            );
+        }
+
+        let error = context.control.last_error();
+        if !error.is_empty() {
+            raised_panel().show(ui, |ui| {
+                ui.label(RichText::new(error).small().color(ERROR));
+            });
+        } else if let Some(model) = context.control.last_saved_model() {
+            ui.label(
+                RichText::new(format!("SAVED  •  {}", model.model_id))
+                    .small()
+                    .monospace()
+                    .color(SUCCESS),
+            );
+        }
+
+        action_button(ui, context, status);
+    });
+}
+
+fn status_guidance(status: TrainerStatus) -> &'static str {
+    match status {
+        TrainerStatus::Loading => "Preparing the capture recorder.",
+        TrainerStatus::Ready => "Arm, then start the DAW transport when Generator is ready.",
+        TrainerStatus::Armed | TrainerStatus::Waiting => {
+            "Waiting for Play. Stop and restart transport if it was already running."
+        }
+        TrainerStatus::Recording => "Recording the processed return signal.",
+        TrainerStatus::Captured => "Capture complete. Preparing alignment and training.",
+        TrainerStatus::Aligning => "Aligning the returned signal to the emitted reference.",
+        TrainerStatus::Training => "Training the model and retaining the best validation pass.",
+        TrainerStatus::ModelSaved => "The model is ready in the shared model library.",
+        TrainerStatus::Invalid => "Capture was interrupted. Arm again for a fresh take.",
+        TrainerStatus::Error => "Review the message below, then arm again when resolved.",
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Action {
+    Arm,
+    Disarm,
+    CancelTraining,
+    None,
+}
+
+#[derive(Clone, Copy)]
+enum ActionStyle {
+    Neutral,
+    Active,
+    Danger,
 }
 
 fn action_button(
     ui: &mut egui::Ui,
     context: &PluginContext<MotTrainerParams>,
     status: TrainerStatus,
-    background: Color32,
-    accent: Color32,
-    text: Color32,
 ) {
-    enum Action {
-        Arm,
-        Disarm,
-        CancelTraining,
-        None,
-    }
-
-    let (label, enabled, fill, label_color, action) = match status {
+    let (label, enabled, style, action) = match status {
         TrainerStatus::Ready
         | TrainerStatus::Invalid
         | TrainerStatus::ModelSaved
-        | TrainerStatus::Error => (
-            "ARM",
-            true,
-            Color32::from_rgb(66, 68, 70),
-            text,
-            Action::Arm,
-        ),
+        | TrainerStatus::Error => ("ARM", true, ActionStyle::Neutral, Action::Arm),
         TrainerStatus::Armed | TrainerStatus::Waiting => {
-            ("ARMED", true, accent, background, Action::Disarm)
+            ("ARMED", true, ActionStyle::Active, Action::Disarm)
         }
-        TrainerStatus::Recording => ("ARMED", false, accent, background, Action::None),
-        TrainerStatus::Captured => (
-            "CANCEL TRAINING",
-            false,
-            Color32::from_rgb(148, 48, 55),
-            text,
-            Action::None,
-        ),
+        TrainerStatus::Recording => ("ARMED", false, ActionStyle::Active, Action::None),
+        TrainerStatus::Captured => ("CANCEL TRAINING", false, ActionStyle::Danger, Action::None),
         TrainerStatus::Aligning | TrainerStatus::Training => (
             "CANCEL TRAINING",
             true,
-            Color32::from_rgb(148, 48, 55),
-            text,
+            ActionStyle::Danger,
             Action::CancelTraining,
         ),
-        TrainerStatus::Loading => (
-            "ARM",
-            false,
-            Color32::from_rgb(66, 68, 70),
-            text,
-            Action::None,
-        ),
+        TrainerStatus::Loading => ("ARM", false, ActionStyle::Neutral, Action::None),
     };
-    let button = egui::Button::new((
-        egui::Atom::grow(),
-        RichText::new(label).strong().color(label_color),
-        egui::Atom::grow(),
-    ))
-    .min_size(Vec2::new(170.0, 36.0))
-    .fill(fill);
+
+    let label =
+        RichText::new(label)
+            .size(15.0)
+            .strong()
+            .color(if matches!(style, ActionStyle::Active) {
+                BACKGROUND
+            } else {
+                TEXT
+            });
+    let button = match style {
+        ActionStyle::Neutral => ghost_button(label),
+        ActionStyle::Active => accent_button(label),
+        ActionStyle::Danger => danger_button(label),
+    }
+    .min_size(Vec2::new(ui.available_width(), 40.0));
+
     if ui.add_enabled(enabled, button).clicked() {
         match action {
             Action::Arm => {
@@ -435,6 +476,82 @@ fn action_button(
     }
 }
 
+fn metadata_editor(ui: &mut egui::Ui, context: &PluginContext<MotTrainerParams>) {
+    let editing_enabled = model_editing_enabled(context.control.status());
+    egui::CollapsingHeader::new(section_label("CAPTURE METADATA"))
+        .default_open(false)
+        .show(ui, |ui| {
+            raised_panel().show(ui, |ui| {
+                ui.add_enabled_ui(editing_enabled, |ui| {
+                    egui::Grid::new("mot_trainer_metadata")
+                        .num_columns(2)
+                        .spacing([22.0, mot_ui::ROW_GAP])
+                        .show(ui, |ui| {
+                            text_field(ui, "AMPLIFIER", &context.amplifier, "EVH 5153");
+                            text_field(ui, "CHANNEL", &context.amplifier_channel, "Blue");
+                            text_field(
+                                ui,
+                                "CONTROLS",
+                                &context.control_positions,
+                                "Gain 5, Bass 4…",
+                            );
+                            text_field(
+                                ui,
+                                "INTERFACE OUT",
+                                &context.interface_output,
+                                "Line Out 3",
+                            );
+                            text_field(ui, "INTERFACE IN", &context.interface_input, "Input 1");
+                            text_field(ui, "REAMP BOX", &context.reamp_box, "Model");
+                            text_field(
+                                ui,
+                                "REACTIVE LOAD",
+                                &context.reactive_load,
+                                "Model / raw out",
+                            );
+
+                            ui.label(field_label("IMPEDANCE"));
+                            let mut impedance = context.load_impedance_ohms.load().min(64);
+                            if ui
+                                .add(
+                                    egui::DragValue::new(&mut impedance)
+                                        .range(0..=64)
+                                        .suffix(" Ω"),
+                                )
+                                .changed()
+                            {
+                                context.load_impedance_ohms.store(impedance);
+                            }
+                            ui.end_row();
+
+                            text_field(
+                                ui,
+                                "RETURN GAIN",
+                                &context.return_gain_note,
+                                "Interface gain / pad",
+                            );
+                        });
+                });
+            });
+        });
+}
+
+fn text_field(ui: &mut egui::Ui, label: &str, value: &std::sync::RwLock<String>, hint: &str) {
+    ui.label(field_label(label));
+    let mut edited = read_lock_string(value);
+    if ui
+        .add(
+            egui::TextEdit::singleline(&mut edited)
+                .hint_text(hint)
+                .desired_width(CONFIG_FIELD_WIDTH),
+        )
+        .changed()
+    {
+        write_lock_string(value, &edited);
+    }
+    ui.end_row();
+}
+
 fn model_editing_enabled(status: TrainerStatus) -> bool {
     !matches!(
         status,
@@ -448,10 +565,9 @@ fn model_editing_enabled(status: TrainerStatus) -> bool {
 }
 
 fn monitor_control_available(status: TrainerStatus) -> bool {
-    matches!(
-        status,
-        TrainerStatus::Armed | TrainerStatus::Waiting | TrainerStatus::Recording
-    )
+    // The DSP exposes the live return only while the recorder is actively
+    // consuming audio. Captured buffers are trained offline, not replayed.
+    matches!(status, TrainerStatus::Recording)
 }
 
 fn capture_details_visible(status: TrainerStatus, progress: f32) -> bool {
@@ -513,6 +629,18 @@ fn format_duration(seconds: f64) -> String {
         format!("{hours}:{minutes:02}:{seconds:02}")
     } else {
         format!("{minutes}:{seconds:02}")
+    }
+}
+
+fn status_color(status: TrainerStatus) -> Color32 {
+    match status {
+        TrainerStatus::Error | TrainerStatus::Invalid => ERROR,
+        TrainerStatus::ModelSaved => SUCCESS,
+        TrainerStatus::Armed | TrainerStatus::Waiting => WAITING,
+        TrainerStatus::Recording | TrainerStatus::Captured | TrainerStatus::Aligning => ACCENT,
+        TrainerStatus::Training => ACCENT,
+        TrainerStatus::Loading => DIM,
+        TrainerStatus::Ready => TEXT,
     }
 }
 
@@ -585,79 +713,4 @@ fn apply_capture_preset(context: &PluginContext<MotTrainerParams>, capture: &Tra
         .load_impedance_ohms
         .store(capture.load_impedance_ohms.map_or(0, u64::from));
     write_lock_string(&context.return_gain_note, &capture.return_gain_note);
-}
-
-fn text_field(
-    ui: &mut egui::Ui,
-    label: &str,
-    value: &std::sync::RwLock<String>,
-    hint: &str,
-    dim: Color32,
-) {
-    ui.label(RichText::new(label).color(dim));
-    let mut edited = read_lock_string(value);
-    if ui
-        .add(
-            egui::TextEdit::singleline(&mut edited)
-                .hint_text(hint)
-                .desired_width(390.0),
-        )
-        .changed()
-    {
-        write_lock_string(value, &edited);
-    }
-    ui.end_row();
-}
-
-impl TrainerStatus {
-    fn color(self, accent: Color32) -> Color32 {
-        match self {
-            Self::Error | Self::Invalid => Color32::from_rgb(235, 95, 95),
-            Self::ModelSaved => Color32::from_rgb(77, 190, 134),
-            Self::Training | Self::Aligning | Self::Recording => accent,
-            _ => Color32::from_rgb(185, 196, 201),
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn eta_uses_the_average_completed_pass_duration() {
-        let snapshot = TrainingSnapshot {
-            epoch: 4,
-            maximum_epochs: 100,
-            elapsed_seconds: 135.0,
-            epoch_seconds: 33.0,
-            device: "METAL".to_owned(),
-            ..TrainingSnapshot::default()
-        };
-        assert_eq!(
-            estimated_training_remaining_seconds(&snapshot),
-            Some(3_240.0)
-        );
-        assert_eq!(
-            training_detail_text(&snapshot),
-            "elapsed 2:15  •  pass 0:33  •  ETA 54:00"
-        );
-    }
-
-    #[test]
-    fn duration_format_is_compact_and_stable() {
-        assert_eq!(format_duration(0.0), "0:00");
-        assert_eq!(format_duration(65.4), "1:05");
-        assert_eq!(format_duration(3_661.0), "1:01:01");
-    }
-
-    #[test]
-    fn monitor_control_is_available_only_around_capture() {
-        assert!(!monitor_control_available(TrainerStatus::Ready));
-        assert!(monitor_control_available(TrainerStatus::Armed));
-        assert!(monitor_control_available(TrainerStatus::Waiting));
-        assert!(monitor_control_available(TrainerStatus::Recording));
-        assert!(!monitor_control_available(TrainerStatus::Captured));
-        assert!(!monitor_control_available(TrainerStatus::Training));
-    }
 }

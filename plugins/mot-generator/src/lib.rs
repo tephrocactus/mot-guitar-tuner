@@ -16,7 +16,7 @@ use truce_egui::EguiEditor;
 
 use editor::{GeneratorUi, WINDOW_SIZE};
 
-pub const VERSION: &str = "0.4.7";
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 const READY_CAPACITY: usize = 2;
 const RETIRED_CAPACITY: usize = 4;
 

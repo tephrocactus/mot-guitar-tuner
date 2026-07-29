@@ -1025,7 +1025,7 @@ pub struct TrainingAlignment {
     pub applied_training_shift_samples: f64,
 }
 
-#[must_use]
+#[must_use = "the validated alignment must be applied to the training pair"]
 pub fn resolve_training_alignment(
     target: CaptureTarget,
     measured: AlignmentResult,

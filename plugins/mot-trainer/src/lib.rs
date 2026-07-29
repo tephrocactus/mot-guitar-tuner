@@ -966,8 +966,7 @@ fn train_and_publish(
     )
     .map_err(|error| error.to_string())?;
 
-    write_capture_record(
-        &capture_dir,
+    let capture_record = capture_record_json(
         &model_id,
         timestamp,
         training_alignment.measured.fractional_latency_samples,
@@ -976,6 +975,8 @@ fn train_and_publish(
         &capture_metadata,
         &outcome,
     )?;
+    fs::write(capture_dir.join("capture.json"), capture_record)
+        .map_err(|error| error.to_string())?;
 
     if outcome.stop_reason == A2TrainingStopReason::Cancelled {
         return Err(format!(
@@ -1047,28 +1048,6 @@ fn ensure_training_active(
         return Err(format!("Training cancelled{preserved}"));
     }
     Ok(())
-}
-
-fn write_capture_record(
-    capture_dir: &Path,
-    model_id: &str,
-    timestamp: u64,
-    measured_latency_samples: f64,
-    applied_latency_samples: f64,
-    correlation: f64,
-    metadata: &HardwareCaptureMetadata,
-    outcome: &A2TrainingOutcome,
-) -> Result<(), String> {
-    let json = capture_record_json(
-        model_id,
-        timestamp,
-        measured_latency_samples,
-        applied_latency_samples,
-        correlation,
-        metadata,
-        outcome,
-    )?;
-    fs::write(capture_dir.join("capture.json"), json).map_err(|error| error.to_string())
 }
 
 fn capture_record_json(

@@ -16,7 +16,7 @@ use truce_egui::EguiEditor;
 
 use editor::{GeneratorUi, WINDOW_SIZE};
 
-pub const VERSION: &str = "0.4.1";
+pub const VERSION: &str = "0.4.2";
 const READY_CAPACITY: usize = 2;
 const RETIRED_CAPACITY: usize = 4;
 
@@ -316,7 +316,7 @@ impl MotGenerator {
     }
 
     #[inline]
-    fn release_arm_toggle_after_start(&mut self, params: &GeneratorParams) {
+    fn release_arm_toggle_after_finish(&mut self, params: &GeneratorParams) {
         if !self.arm_latched {
             return;
         }
@@ -325,12 +325,7 @@ impl MotGenerator {
         };
         if matches!(
             prepared.engine.state(),
-            SplitCaptureState::PreRoll { .. }
-                | SplitCaptureState::Program { .. }
-                | SplitCaptureState::Tail { .. }
-                | SplitCaptureState::AlignmentMargin { .. }
-                | SplitCaptureState::Ready
-                | SplitCaptureState::Invalid(_)
+            SplitCaptureState::Ready | SplitCaptureState::Invalid(_)
         ) {
             self.arm_latched = false;
             self.observed_arm_command = clear_arm_command(&params.arm_command);
@@ -412,7 +407,7 @@ impl PluginLogic for MotGenerator {
                 );
             }
         }
-        state.release_arm_toggle_after_start(params);
+        state.release_arm_toggle_after_finish(params);
 
         let (status, progress) = generator_meter_state(state, samples);
         context.set_meter(P::Status, f32::from(status) / 7.0);
@@ -536,7 +531,7 @@ mod tests {
     }
 
     #[test]
-    fn arm_uses_the_ui_transport_snapshot_and_releases_after_start() {
+    fn arm_uses_the_ui_transport_snapshot_and_releases_after_finish() {
         let params = GeneratorParams::new();
         params
             .arm_transport_was_playing
@@ -584,7 +579,27 @@ mod tests {
             }
         ));
 
-        state.release_arm_toggle_after_start(&params);
+        state.release_arm_toggle_after_finish(&params);
+        assert!(state.arm_latched);
+        assert!(arm_command_is_active(
+            params.arm_command.load(Ordering::Acquire)
+        ));
+
+        state.prepared.as_mut().unwrap().engine.process_block(
+            &mut output,
+            CaptureTransportInfo {
+                playing: false,
+                timeline_sample: Some(64),
+                sample_rate_hz: CAPTURE_SAMPLE_RATE_HZ,
+                ..CaptureTransportInfo::default()
+            },
+        );
+        assert!(matches!(
+            state.prepared.as_ref().unwrap().engine.state(),
+            SplitCaptureState::Invalid(_)
+        ));
+
+        state.release_arm_toggle_after_finish(&params);
         assert!(!state.arm_latched);
         assert!(!arm_command_is_active(
             params.arm_command.load(Ordering::Acquire)

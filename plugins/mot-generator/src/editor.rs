@@ -90,9 +90,16 @@ impl EditorUi<GeneratorParams> for GeneratorUi {
                         let ready = generator_can_arm(load_status, normalized_status);
                         let arm_command = context.arm_command.load(Ordering::Acquire);
                         let armed = arm_command_is_active(arm_command);
+                        let status_code =
+                            (normalized_status.clamp(0.0, 1.0) * 7.0).round() as u8;
+                        let capture_running = matches!(status_code, 3..=5);
                         let arm = ui.add_enabled(
-                            armed || ready,
-                            egui::Button::new(RichText::new("ARM").strong().size(16.0))
+                            if armed { !capture_running } else { ready },
+                            egui::Button::new((
+                                egui::Atom::grow(),
+                                RichText::new("ARM").strong().size(16.0),
+                                egui::Atom::grow(),
+                            ))
                                 .selected(armed)
                                 .min_size(egui::vec2(86.0, 36.0)),
                         );
@@ -110,7 +117,7 @@ impl EditorUi<GeneratorParams> for GeneratorUi {
                             }
                             context.arm_command.fetch_add(1, Ordering::AcqRel);
                         }
-                        if armed {
+                        if armed && matches!(status_code, 0..=2) {
                             ui.add_space(8.0);
                             ui.label(
                                 RichText::new(
@@ -120,12 +127,11 @@ impl EditorUi<GeneratorParams> for GeneratorUi {
                             );
                         }
 
-                        ui.add_space(18.0);
-                        let progress = context.get_meter(P::Progress).clamp(0.0, 1.0);
-                        ui.add(
-                            egui::ProgressBar::new(progress)
-                                .show_percentage(),
-                        );
+                        if armed {
+                            ui.add_space(18.0);
+                            let progress = context.get_meter(P::Progress).clamp(0.0, 1.0);
+                            ui.add(egui::ProgressBar::new(progress).show_percentage());
+                        }
                     });
             });
     }

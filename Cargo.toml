@@ -1,6 +1,6 @@
 [package]
 name = "mot-core"
-version = "0.5.2"
+version = "0.5.4"
 edition = "2024"
 autobins = false
 

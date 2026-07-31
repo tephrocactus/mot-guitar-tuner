@@ -808,11 +808,11 @@ dependencies = [
 
 [[package]]
 name = "mot-core"
-version = "0.5.2"
+version = "0.5.4"
 
 [[package]]
 name = "mot-tuner"
-version = "0.5.2"
+version = "0.5.4"
 dependencies = [
  "egui",
  "mot-core",

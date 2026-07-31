@@ -8,6 +8,8 @@ use truce_egui::EditorUi;
 use crate::{MotTunerParams, P, VERSION, notes, offsets, round_to_tenth};
 
 pub(crate) const WINDOW_SIZE: (u32, u32) = (900, 720);
+const STRING_EDITOR_HEIGHT: f32 = 292.0;
+const MIN_STROBE_HEIGHT: f32 = 240.0;
 const OFFSET_MIN: f32 = -25.0;
 const OFFSET_MAX: f32 = 25.0;
 
@@ -33,13 +35,24 @@ impl EditorUi<MotTunerParams> for MotTunerUi {
                 }
             });
 
-            let table_height = 250.0;
-            let strobe_height =
-                (ui.available_height() - table_height - mot_ui::SECTION_GAP).max(280.0);
-            strobe(ui, context, strobe_height);
-            let extra_section_gap = (mot_ui::SECTION_GAP - ui.spacing().item_spacing.y).max(0.0);
-            ui.add_space(extra_section_gap);
-            string_editor(ui, context);
+            let body_height = ui.available_height();
+            egui::ScrollArea::vertical()
+                .id_salt("mot_tuner_body")
+                .auto_shrink([false, false])
+                .max_height(body_height)
+                .show(ui, |ui| {
+                    // Keep the complete seven-string editor visible. Its title, header,
+                    // seven control rows, grid gaps and panel margins need about 290 px.
+                    // On a short host surface the body scrolls instead of clipping either
+                    // the string editor or the useful minimum height of the strobe.
+                    let strobe_height = (body_height - STRING_EDITOR_HEIGHT - mot_ui::SECTION_GAP)
+                        .max(MIN_STROBE_HEIGHT);
+                    strobe(ui, context, strobe_height);
+                    let extra_section_gap =
+                        (mot_ui::SECTION_GAP - ui.spacing().item_spacing.y).max(0.0);
+                    ui.add_space(extra_section_gap);
+                    string_editor(ui, context);
+                });
         });
     }
 }
